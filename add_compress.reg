@@ -1,0 +1,8 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Classes\*\shell\CompressTo25MB]
+@="Compress to 10MB MP4"
+"AppliesTo"="System.FileExtension:=\".mp4\" OR System.FileExtension:=\".mov\" OR System.FileExtension:=\".mkv\" OR System.FileExtension:=\".avi\""
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Classes\*\shell\CompressTo25MB\command]
+@="powershell.exe -ExecutionPolicy Bypass -File \"C:\\!Dev\\Video_Editor\\compress_video.ps1\" \"%1\""
