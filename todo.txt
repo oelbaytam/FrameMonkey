@@ -1,10 +1,12 @@
 STILL NEED TO ADD (in no particular order):
 
+
  - add variable frame frate
 
  - Support for multiple audio/video tracks - there is an nvidia shadowplay setting to seperate mic and desktop audio, this needs to be accounted for and they need to be squished into one
 
  - more robust video length scaling , maybe also check file size
 
- - make work for non-nvidia gpus and if no gpu present, switch to software encoding
+ ----------DONE----------
+- add AMD/Intel gpu support, switching to software encoding of not available
 

@@ -1,5 +1,3 @@
-param([string]$inputFile)
-
 # This is a compression method that scales resolution and framerate with the length of the video it is compressing, below are the thresholds for the resolution and framerate:
 
 # Resolution:
@@ -15,37 +13,118 @@ param([string]$inputFile)
 # - Videos longer than 40 seconds will be compressed to 30fps
 # - Videos shorter than 40 seconds will maintain their native framerate
 
+param([string]$inputFile)
+
+# Function to detect available GPU and set appropriate encoder
+function Get-GPUEncoder {
+    try {
+        # Check for NVIDIA GPU
+        $nvidia = & nvidia-smi --query-gpu=gpu_name --format=csv,noheader 2>$null
+        if ($nvidia) {
+            Write-Host "GPU Detected: NVIDIA $($nvidia.Trim())" -ForegroundColor Green
+            Write-Host "Using NVENC encoder (h264_nvenc)" -ForegroundColor Green
+            return @{
+                hwaccel = "cuda"
+                hwaccel_output_format = "cuda"
+                decoder = "h264_cuvid"
+                encoder = "h264_nvenc"
+                scale_filter = "scale_cuda"
+                preset = "p1"
+            }
+        }
+        
+        # Check for AMD GPU
+        $amd = amf-encoder-test 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $amdGpu = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Radeon*" }
+            Write-Host "GPU Detected: $($amdGpu.Caption)" -ForegroundColor Green
+            Write-Host "Using AMF encoder (h264_amf)" -ForegroundColor Green
+            return @{
+                hwaccel = "amf"
+                hwaccel_output_format = "nv12"
+                decoder = "h264"
+                encoder = "h264_amf"
+                scale_filter = "scale"
+                preset = "quality"
+            }
+        }
+        
+        # Check for Intel GPU
+        $intel = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Intel*" }
+        if ($intel) {
+            Write-Host "GPU Detected: $($intel.Caption)" -ForegroundColor Green
+            Write-Host "Using QuickSync encoder (h264_qsv)" -ForegroundColor Green
+            return @{
+                hwaccel = "qsv"
+                hwaccel_output_format = "nv12"
+                decoder = "h264_qsv"
+                encoder = "h264_qsv"
+                scale_filter = "scale"
+                preset = "veryslow"
+            }
+        }
+        
+        Write-Host "No supported GPU detected. Using CPU encoding..." -ForegroundColor Yellow
+        Write-Host "Using CPU encoder (libx264)" -ForegroundColor Yellow
+        return @{
+            hwaccel = $null
+            hwaccel_output_format = $null
+            decoder = "h264"
+            encoder = "libx264"
+            scale_filter = "scale"
+            preset = "medium"
+        }
+    }
+    catch {
+        Write-Host "Error detecting GPU. Using CPU encoding..." -ForegroundColor Yellow
+        return @{
+            hwaccel = $null
+            hwaccel_output_format = $null
+            decoder = "h264"
+            encoder = "libx264"
+            scale_filter = "scale"
+            preset = "medium"
+        }
+    }
+}
+
 try {
+    $startTime = Get-Date
+    
     # Constants - using 93% of 10MB as target
     $MAX_SIZE_BYTES = 10485760 * 0.93
     
     # Set encoding parameters
-    $NVENC_PRESET = "p1"
     $MIN_AUDIO_BITRATE = 48
     $TUNE = "hq"
     $PROFILE = "high"
     
-    # Get video resolution and fps
-    $resolution = & ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 $inputFile
-    $width, $height = $resolution.Split('x')
+    # Get GPU encoder settings
+    $gpu = Get-GPUEncoder
     
-    # Dynamic scaling based on video length and resolution
+    # Get video information
+    $videoInfo = & ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate -of json $inputFile | ConvertFrom-Json
+    $width = $videoInfo.streams[0].width
+    $height = $videoInfo.streams[0].height
+    $originalFps = [math]::Round([decimal]($videoInfo.streams[0].r_frame_rate -split '/')[0] / ($videoInfo.streams[0].r_frame_rate -split '/')[1], 2)
+    
+    Write-Host "`nInput Video Details:" -ForegroundColor Cyan
+    Write-Host "Resolution: ${width}x${height}"
+    Write-Host "Framerate: $originalFps FPS"
+    
+    # Get video duration
     $duration = & ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 $inputFile
     $duration_int = [math]::Floor([double]$duration)
     
     # Determine target FPS based on duration
-    if ($duration_int -gt 240 ) {
+    if ($duration_int -gt 240) {
         $target_fps = 15
-        Write-Host "Video longer than 4 minutes - targeting 15fps for better quality"
     } elseif ($duration_int -gt 80) {
         $target_fps = 24
-        Write-Host "Video longer than 80 seconds - targeting 24fps for better quality"
     } elseif ($duration_int -gt 40) {
         $target_fps = 30
-        Write-Host "Video longer than 40 seconds - targeting 30fps for better quality"
     } else {
         $target_fps = 60
-        Write-Host "Video shorter than 30 sec - maintaining 60fps"
     }
     
     # Calculate target resolution based on duration
@@ -60,13 +139,11 @@ try {
     } elseif ($duration_int -gt 10) {  # > 10 seconds
         $target_height = 1080
     } else {                           # <= 10 seconds
-        # Keep native resolution
         $target_height = $height
-        Write-Host "Video shorter than 10 seconds - maintaining native resolution"
     }
     
     # Include FPS adjustment in scale filter
-    $SCALE = "-vf `"scale_cuda=-2:$target_height,fps=$target_fps`""
+    $SCALE = "-vf `"$($gpu.scale_filter)=-2:$target_height,fps=$target_fps`""
 
     # Calculate bitrates
     $total_available_bytes = $MAX_SIZE_BYTES
@@ -74,35 +151,50 @@ try {
     $video_bytes = $total_available_bytes - $audio_bytes
     $video_bitrate = [math]::Floor(($video_bytes * 8) / $duration_int / 1000 * 0.97)
 
-    Write-Host "Starting hardware-accelerated compression..."
-    Write-Host "Target total size: $($MAX_SIZE_BYTES/1024/1024)MB"
-    Write-Host "Video bitrate: $video_bitrate kbps"
-    Write-Host "Audio bitrate: $MIN_AUDIO_BITRATE kbps"
-    Write-Host "Target resolution: ${target_height}p"
-    Write-Host "Target FPS: $target_fps"
+    Write-Host "`nCompression Settings:" -ForegroundColor Cyan
+    Write-Host "Target Resolution: ${target_height}p"
+    Write-Host "Target Framerate: $target_fps FPS"
+    Write-Host "Video Bitrate: $video_bitrate kbps"
+    Write-Host "Audio Bitrate: $MIN_AUDIO_BITRATE kbps"
+    Write-Host "Using encoder: $($gpu.encoder)`n"
 
     # Create output filename
     $output_file = [System.IO.Path]::GetDirectoryName($inputFile) + "\" + 
                   [System.IO.Path]::GetFileNameWithoutExtension($inputFile) + 
                   "_compressed.mp4"
 
-    # Build ffmpeg command - Using CBR for strict size control
+    # Build ffmpeg command
     $ffmpeg_args = @(
         "-y",
-        "-hwaccel", "cuda",
-        "-hwaccel_output_format", "cuda",
-        "-c:v", "h264_cuvid",
+        "-loglevel", "error",
+        "-stats"
+    )
+
+    # Add hardware acceleration if available
+    if ($gpu.hwaccel) {
+        $ffmpeg_args += @(
+            "-hwaccel", $gpu.hwaccel
+        )
+        if ($gpu.hwaccel_output_format) {
+            $ffmpeg_args += @(
+                "-hwaccel_output_format", $gpu.hwaccel_output_format
+            )
+        }
+    }
+
+    # Add input decoder and file
+    $ffmpeg_args += @(
+        "-c:v", $gpu.decoder,
         "-i", $inputFile,
-        "-c:v", "h264_nvenc",
-        "-preset", $NVENC_PRESET,
+        "-c:v", $gpu.encoder,
+        "-preset", $gpu.preset,
         "-tune", $TUNE,
-        "-rc", "cbr",              # Constant Bitrate mode
+        "-rc", "cbr",
         "-b:v", "${video_bitrate}k",
         "-maxrate", "${video_bitrate}k",
-        "-minrate", "${video_bitrate}k",  # Force constant bitrate
-        "-bufsize", "${video_bitrate}k",  # Match bitrate for CBR
-        "-profile:v", $PROFILE,
-        "-gpu", "any"
+        "-minrate", "${video_bitrate}k",
+        "-bufsize", "${video_bitrate}k",
+        "-profile:v", $PROFILE
     )
 
     # Add scaling and fps adjustment
@@ -122,16 +214,30 @@ try {
     Write-Host "Compressing video and audio..."
     & ffmpeg $ffmpeg_args
 
-    # Verify final size
+    $endTime = Get-Date
+    $processingTime = ($endTime - $startTime).TotalSeconds
+
+    # Get final video info
+    $finalVideoInfo = & ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,bit_rate -of json $output_file | ConvertFrom-Json
+    $finalBitrate = [math]::Round([int]$finalVideoInfo.streams[0].bit_rate / 1000)
+    $finalFps = [math]::Round([decimal]($finalVideoInfo.streams[0].r_frame_rate -split '/')[0] / ($finalVideoInfo.streams[0].r_frame_rate -split '/')[1], 2)
+    
+    # Verify final size and show results
     $final_size_mb = (Get-Item $output_file).Length/1024/1024
-    Write-Host "`nCompression complete!"
-    Write-Host "Final file size: $($final_size_mb.ToString('0.00'))MB"
+    $original_size_mb = (Get-Item $inputFile).Length/1024/1024
+    Write-Host "`nCompression Results:" -ForegroundColor Cyan
+    Write-Host "Time taken: $([math]::Round($processingTime, 2)) seconds"
+    Write-Host "Original size: $($original_size_mb.ToString('0.00')) MB"
+    Write-Host "Final size: $($final_size_mb.ToString('0.00')) MB"
+    Write-Host "Compression ratio: $([math]::Round($original_size_mb/$final_size_mb, 2)):1"
+    Write-Host "Final resolution: $($finalVideoInfo.streams[0].width)x$($finalVideoInfo.streams[0].height)"
+    Write-Host "Final framerate: $finalFps FPS"
+    Write-Host "Final video bitrate: $finalBitrate kbps"
     Write-Host "Output saved as: $output_file"
 
     if ($final_size_mb -gt 10) {
-        Write-Host "`nError: File size exceeds 10MB limit! Please try again with a lower quality setting."
+        Write-Host "`nError!: File size exceeds 10MB limit! No video output file was made." -ForegroundColor Red
         Remove-Item $output_file
-        exit 1
     }
 }
 catch {
