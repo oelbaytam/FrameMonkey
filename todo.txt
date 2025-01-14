@@ -1,0 +1,8 @@
+STILL NEED TO ACCOUNT FOR:
+
+ - Mixed audio/video tracks - there is an nvidia shadowplay setting to seperate mic and desktop audio, this needs to be accounted for and they need to be squished into one
+
+ - more robust video length scaling , maybe also check size
+
+ - make work for non-nvidia gpus and if no gpu present, switch to software encoding
+
