@@ -49,21 +49,30 @@ function Get-GPUEncoder {
             }
             
             # Check for AMD GPU with AV1 support (RX 7000 series)
-            $amd = amf-encoder-test 2>$null
-            if ($LASTEXITCODE -eq 0) {
-                $amdGpu = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Radeon*" }
-                if ($amdGpu.Caption -like "*RX 7*") {
-                    Write-Host "GPU Detected: $($amdGpu.Caption) with AV1 support" -ForegroundColor Green
-                    Write-Host "Using AMF AV1 encoder (av1_amf)" -ForegroundColor Green
-                    return @{
-                        hwaccel = "amf"
-                        hwaccel_output_format = "nv12"
-                        decoder = "av1"
-                        encoder = "av1_amf"
-                        scale_filter = "scale"
-                        preset = "quality"
-                        extra_params = @("-quality", "quality", "-tiles", "2")
-                    }
+            $amdGpu = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Radeon*" }
+            # Check for RX 7000 series
+            if ($amdGpu -and $amdGpu.Caption -match "RX\s+7\d{3}") {
+                Write-Host "GPU Detected: $($amdGpu.Caption) with AV1 support" -ForegroundColor Green
+                Write-Host "Using AMF AV1 encoder (av1_amf)" -ForegroundColor Green
+                return @{
+                    hwaccel = "amf"
+                    hwaccel_output_format = "nv12"
+                    decoder = "av1"  # AMD decoder for AV1
+                    encoder = "av1_amf"
+                    scale_filter = "scale"
+                    preset = "quality"
+                    extra_params = @(
+                        "-quality", "quality",
+                        "-usage", "transcoding",
+                        "-rc", "vbr_latency",  # Better rate control for AMD
+                        "-async_depth", "1",   # Helps with stability
+                        "-max_lab", "1",       # Helps with latency
+                        "-header_insertion_mode", "idr",  # Better keyframe handling
+                        "-gops_per_idr", "1",  # IDR frame frequency
+                        "-tiles", "2",         # Multi-tile encoding
+                        "-bf_delta_qp", "0",   # Disable B-frame delta QP
+                        "-refs", "2"           # Reference frames
+                    )
                 }
             }
             
