@@ -243,7 +243,6 @@ try {
 catch {
     Write-Host "`nAn error occurred:"
     Write-Host $_
-    exit 1
 }
 
 Write-Host "`nWindow will stay open for 30 seconds. Press Ctrl+C to close immediately..."

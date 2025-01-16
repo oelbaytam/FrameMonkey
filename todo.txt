@@ -1,4 +1,8 @@
-STILL NEED TO ADD (in no particular order):
+-----!BROKEN!-----
+- cannot detect AMD GPU and when switching to software (cpu) it fails.
+
+TODO (in no particular order):
+
 
 
  - add variable frame frate
