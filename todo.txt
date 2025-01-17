@@ -1,16 +1,86 @@
 -----!BROKEN!-----
-- cannot detect AMD GPU and when switching to software (cpu) it fails.
+- nothing that I know of!!!! (Yippie)
 
-TODO (in no particular order):
-
-
+-----TODO (in no particular order):-----
 
  - add variable frame frate
 
  - Support for multiple audio/video tracks - there is an nvidia shadowplay setting to seperate mic and desktop audio, this needs to be accounted for and they need to be squished into one
 
+ - add easier to control thresholds for target resolution, fps, when vfr is enabled, etc
+
  - more robust video length scaling , maybe also check file size
 
+
+-----Code is now in format as follows:-----
+
+get codec
+get gpu
+
+switch(gpu){
+
+    case(nvidia){
+
+        switch(codec){
+
+            case(h264){
+                # h264 related nvidia encoding
+            }
+            case(av1){
+                # av1 related nvidia encoding
+            }
+
+        }
+
+
+        case(amd){
+
+            switch(codec){
+    
+                case(h264){
+                    # h264 related amd encoding
+                }
+                case(av1){
+                    # av1 related amd encoding
+                }
+    
+            }
+
+        }
+
+        case(intel){
+
+            switch(codec){
+    
+                case(h264){
+                    # h264 related intel gpu encoding
+                }
+                case(av1){
+                    # av1 related intep gpu encoding
+                }
+    
+            }
+    }
+
+        default{
+            # cpu encoding fallback
+            switch(codec){
+    
+                case(h264){
+                    # h264 related cpu encoding fallback
+                }
+                case(av1){
+                    # av1 related cpu encoding fallback
+                }
+    
+            }
+        
+        }
+    }   
+}
+
+
  ----------DONE----------
+
 - add AMD/Intel gpu support, switching to software encoding of not available
 

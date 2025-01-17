@@ -13,156 +13,104 @@
 # - Videos longer than 40 seconds will be compressed to 30fps
 # - Videos shorter than 40 seconds will maintain their native framerate
 
-param([string]$inputFile)
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$inputFile
+)
 
-# Function to determine which video codec the source file uses to decode it properly
-function Get-VideoCodec {
-    param([string]$inputFile)
-    
-    $codecInfo = & ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 $inputFile
-    return $codecInfo.Trim()
+# Verify required tools are available
+function Test-Requirements {
+    try {
+        $ffmpeg = & ffmpeg -version 2>$null
+        $ffprobe = & ffprobe -version 2>$null
+        
+        if ($LASTEXITCODE -ne 0) {
+            throw "FFmpeg/FFprobe not found. Please ensure FFmpeg is installed and in your PATH."
+        }
+        
+        if (-not (Test-Path $inputFile)) {
+            throw "Input file not found: $inputFile"
+        }
+        
+        $fileInfo = Get-Item $inputFile
+        if ($fileInfo.Length -eq 0) {
+            throw "Input file is empty"
+        }
+        
+        return $true
+    }
+    catch {
+        Write-Host "Requirement check failed: $_" -ForegroundColor Red
+        return $false
+    }
 }
-
-# Function to detect available GPU and set appropriate encoder
-
-# Function to detect available GPU and set appropriate encoder
-function Get-GPUEncoder {
-    param([string]$codec)
+# Function to determine which video codec the source file uses
+function Get-VideoCodec {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$inputFile
+    )
     
     try {
-        # If input is AV1, check for hardware support first
-        if ($codec -eq "av1") {
-            # Check for NVIDIA GPU with AV1 support (RTX 40 series) 
-            $nvidia = & nvidia-smi --query-gpu=gpu_name --format=csv,noheader 2>$null
-            if ($nvidia -and $nvidia -like "*RTX 40*") {
-                Write-Host "GPU Detected: NVIDIA $($nvidia.Trim()) with AV1 support" -ForegroundColor Green
-                Write-Host "Using NVENC AV1 encoder (av1_nvenc)" -ForegroundColor Green
-                return @{
-                    hwaccel = "cuda"
-                    hwaccel_output_format = "cuda"
-                    decoder = "av1_cuvid"
-                    encoder = "av1_nvenc"
-                    scale_filter = "scale_cuda"
-                    preset = "p4"
-                    extra_params = @("-rc-lookahead", "32", "-tile-columns", "2")
-                }
-            }
-            
-            # Check for AMD GPU with AV1 support (RX 7000 series)
-            $amdGpu = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Radeon*" }
-            # Check for RX 7000 series
-            if ($amdGpu -and $amdGpu.Caption -match "RX\s+7\d{3}") {
-                Write-Host "GPU Detected: $($amdGpu.Caption) with AV1 support" -ForegroundColor Green
-                Write-Host "Using AMF AV1 encoder (av1_amf)" -ForegroundColor Green
-                return @{
-                    hwaccel = "amf"
-                    hwaccel_output_format = "nv12"
-                    decoder = "av1"  # AMD decoder for AV1
-                    encoder = "av1_amf"
-                    scale_filter = "scale"
-                    preset = "quality"
-                    extra_params = @(
-                        "-quality", "quality",
-                        "-usage", "transcoding",
-                        "-rc", "vbr_latency",  # Better rate control for AMD
-                        "-async_depth", "1",   # Helps with stability
-                        "-max_lab", "1",       # Helps with latency
-                        "-header_insertion_mode", "idr",  # Better keyframe handling
-                        "-gops_per_idr", "1",  # IDR frame frequency
-                        "-tiles", "2",         # Multi-tile encoding
-                        "-bf_delta_qp", "0",   # Disable B-frame delta QP
-                        "-refs", "2"           # Reference frames
-                    )
-                }
-            }
-            
-            # Check for Intel GPU with AV1 support (Arc series)
-            $intel = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Arc*" }
-            if ($intel) {
-                Write-Host "GPU Detected: $($intel.Caption) with AV1 support" -ForegroundColor Green
-                Write-Host "Using QuickSync AV1 encoder (av1_qsv)" -ForegroundColor Green
-                return @{
-                    hwaccel = "qsv"
-                    hwaccel_output_format = "nv12"
-                    decoder = "av1_qsv"
-                    encoder = "av1_qsv"
-                    scale_filter = "scale"
-                    preset = "veryslow"
-                    extra_params = @("-look_ahead", "32", "-tile_cols", "2")
-                }
-            }
-            
-            # If no hardware AV1 support, use CPU-based AV1 codec with better configuration
-            Write-Host "No hardware AV1 support detected! Using CPU-based AV1 encoder (libaom-av1)" -ForegroundColor Red
-            Write-Host "THIS WILL BE MUCH SLOWER!!!" -ForegroundColor Red
-            return @{
-                hwaccel = $null
-                hwaccel_output_format = $null
-                decoder = "libdav1d"  # Use dav1d software decoder instead of generic av1
-                encoder = "libaom-av1"
-                scale_filter = "scale"
-                preset = "5"
-                extra_params = @(
-                    "-strict", "experimental",
-                    "-cpu-used", "4",       
-                    "-row-mt", "1",         
-                    "-tile-columns", "2",   
-                    "-tile-rows", "1",      
-                    "-threads", "8",
-                    "-lag-in-frames", "25", # Better quality with slight memory increase
-                    "-error-resilient", "1" # Help prevent decode errors
-                )
+        $codecInfo = & ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 $inputFile
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to detect codec"
+        }
+        return $codecInfo.Trim().ToLower()
+    }
+    catch {
+        Write-Host "Error detecting codec: $_" -ForegroundColor Red
+        return 'h264' # Safe fallback
+    }
+}
+
+# Helper function to detect GPU type with improved error handling
+function Get-GPUType {
+    try {
+        # Check for GPUs using WMI first
+        $gpus = Get-WmiObject -Query "SELECT * FROM Win32_VideoController"
+        
+        # Check for AMD GPU first
+        $amd = $gpus | Where-Object { $_.Caption -like "*Radeon*" }
+        if ($amd) {
+            Write-Host "AMD GPU detected: $($amd.Caption)" -ForegroundColor Green
+            return 'amd'
+        }
+        
+        # Then check for NVIDIA GPU
+        $nvidia = $gpus | Where-Object { $_.Caption -like "*NVIDIA*" }
+        if ($nvidia) {
+            # Only try nvidia-smi if we actually found an NVIDIA GPU
+            $nvidiaSmi = & nvidia-smi --query-gpu=gpu_name --format=csv,noheader 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                return 'nvidia'
             }
         }
-        # If input is H264, use original H264 encoding logic
-        elseif ($codec -eq "h264") {
-            # Check for NVIDIA GPU
-            $nvidia = & nvidia-smi --query-gpu=gpu_name --format=csv,noheader 2>$null
-            if ($nvidia) {
-                Write-Host "GPU Detected: NVIDIA $($nvidia.Trim())" -ForegroundColor Green
-                Write-Host "Using NVENC encoder (h264_nvenc)" -ForegroundColor Green
-                return @{
-                    hwaccel = "cuda"
-                    hwaccel_output_format = "cuda"
-                    decoder = "h264_cuvid"
-                    encoder = "h264_nvenc"
-                    scale_filter = "scale_cuda"
-                    preset = "p1"
-                }
-            }
-            
-            # Check for AMD GPU
-            $amd = amf-encoder-test 2>$null
-            if ($LASTEXITCODE -eq 0) {
-                $amdGpu = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Radeon*" }
-                Write-Host "GPU Detected: $($amdGpu.Caption)" -ForegroundColor Green
-                Write-Host "Using AMF encoder (h264_amf)" -ForegroundColor Green
-                return @{
-                    hwaccel = "amf"
-                    hwaccel_output_format = "nv12"
-                    decoder = "h264"
-                    encoder = "h264_amf"
-                    scale_filter = "scale"
-                    preset = "quality"
-                }
-            }
-            
-            # Check for Intel GPU
-            $intel = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Intel*" }
-            if ($intel) {
-                Write-Host "GPU Detected: $($intel.Caption)" -ForegroundColor Green
-                Write-Host "Using QuickSync encoder (h264_qsv)" -ForegroundColor Green
-                return @{
-                    hwaccel = "qsv"
-                    hwaccel_output_format = "nv12"
-                    decoder = "h264_qsv"
-                    encoder = "h264_qsv"
-                    scale_filter = "scale"
-                    preset = "veryslow"
-                }
-            }
-            
-            Write-Host "No supported GPU detected. Using CPU encoding..." -ForegroundColor Yellow
+        
+        # Finally check for Intel GPU
+        $intel = $gpus | Where-Object { $_.Caption -like "*Intel*" }
+        if ($intel) {
+            return 'intel'
+        }
+    }
+    catch {
+        Write-Host "Error during GPU detection: $_" -ForegroundColor Red
+    }
+    
+    Write-Host "No compatible GPU detected, falling back to CPU encoding" -ForegroundColor Yellow
+    return 'cpu' # Safe fallback
+}
+
+# Update the Get-CPUEncoder function
+function Get-CPUEncoder {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateSet('h264','av1')]
+        [string]$codec
+    )
+    
+    switch ($codec) {
+        'h264' {
             Write-Host "Using CPU encoder (libx264)" -ForegroundColor Yellow
             return @{
                 hwaccel = $null
@@ -171,20 +119,16 @@ function Get-GPUEncoder {
                 encoder = "libx264"
                 scale_filter = "scale"
                 preset = "medium"
+                valid = $true
             }
         }
-        else {
-            Write-Host "Unsupported codec: $codec. Falling back to H264..." -ForegroundColor Yellow
-            return Get-GPUEncoder -codec "h264"
-        }
-    }
-    catch {
-        Write-Host "Error detecting GPU. Using CPU encoding..." -ForegroundColor Yellow
-        if ($codec -eq "av1") {
+        'av1' {
+            Write-Host "Using CPU-based AV1 encoder (libaom-av1)" -ForegroundColor Red
+            Write-Host "THIS WILL BE MUCH SLOWER!!!" -ForegroundColor Red
             return @{
                 hwaccel = $null
                 hwaccel_output_format = $null
-                decoder = "libdav1d"
+                decoder = "av1"  # Changed from libdav1d to av1
                 encoder = "libaom-av1"
                 scale_filter = "scale"
                 preset = "5"
@@ -198,191 +142,446 @@ function Get-GPUEncoder {
                     "-lag-in-frames", "25",
                     "-error-resilient", "1"
                 )
+                valid = $true
             }
-        }
-        return @{
-            hwaccel = $null
-            hwaccel_output_format = $null
-            decoder = "h264"
-            encoder = "libx264"
-            scale_filter = "scale"
-            preset = "medium"
         }
     }
 }
 
+function Get-GPUEncoder {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateSet('h264','av1')]
+        [string]$codec
+    )
+    
+    try {
+        $gpuType = Get-GPUType
+        
+        # Main GPU switch
+        switch ($gpuType) {
+            'nvidia' {
+                $encoderConfig = switch ($codec) {
+                    'h264' {
+                        Write-Host "GPU Detected: NVIDIA with H264 support" -ForegroundColor Green
+                        Write-Host "Using NVENC encoder (h264_nvenc)" -ForegroundColor Green
+                        @{
+                            hwaccel = "cuda"
+                            hwaccel_output_format = "cuda"
+                            decoder = "h264_cuvid"
+                            encoder = "h264_nvenc" 
+                            scale_filter = "scale_cuda"
+                            preset = "p1"
+                            valid = $true
+                        }
+                        break
+                    }
+                    'av1' {
+                        # Check if GPU supports AV1 (RTX 40 series)
+                        $nvidia = & nvidia-smi --query-gpu=gpu_name --format=csv,noheader 2>$null
+                        if ($nvidia -like "*RTX 40*") {
+                            Write-Host "GPU Detected: NVIDIA $($nvidia.Trim()) with AV1 support" -ForegroundColor Green
+                            Write-Host "Using NVENC AV1 encoder (av1_nvenc)" -ForegroundColor Green
+                            @{
+                                hwaccel = "cuda"
+                                hwaccel_output_format = "cuda"
+                                decoder = "av1_cuvid"
+                                encoder = "av1_nvenc"
+                                scale_filter = "scale_cuda"
+                                preset = "p4"
+                                extra_params = @("-rc-lookahead", "32", "-tile-columns", "2")
+                                valid = $true
+                            }
+                        }
+                        else {
+                            Get-CPUEncoder -codec $codec
+                        }
+                        break
+                    }
+                }
+                break
+            }
+            'amd' {
+                $encoderConfig = switch ($codec) {
+                    'h264' {
+                        $amdGpu = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Radeon*" }
+                        Write-Host "GPU Detected: $($amdGpu.Caption)" -ForegroundColor Green
+                        Write-Host "Using AMF encoder (h264_amf)" -ForegroundColor Green
+                        @{
+                            hwaccel = "d3d11va"
+                            hwaccel_output_format = "nv12"
+                            decoder = "h264"
+                            encoder = "h264_amf"
+                            scale_filter = "scale"
+                            preset = "quality"
+                            valid = $true
+                        }
+                        break
+                    }
+                    'av1' {
+                        $amdGpu = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Radeon*" }
+                        # Updated regex pattern to match RX 7000 series
+                        if ($amdGpu.Caption -match "RX\s+7\d{3}|RX\s*7\d{3}\s*XT") {
+                            Write-Host "GPU Detected: $($amdGpu.Caption) with AV1 support" -ForegroundColor Green
+                            Write-Host "Using AMF AV1 encoder (av1_amf)" -ForegroundColor Green
+                            @{
+                                hwaccel = "d3d11va"
+                                hwaccel_output_format = "nv12"
+                                decoder = "av1"
+                                encoder = "av1_amf"
+                                scale_filter = "scale"
+                                preset = "quality"
+                                extra_params = @(
+                                    "-quality", "quality",
+                                    "-usage", "transcoding",
+                                    "-rc", "vbr_latency",
+                                    "-async_depth", "1",
+                                    "-max_lab", "1",
+                                    # "-header_insertion_mode", "idr",
+                                    "-gops_per_idr", "1",
+                                    "-tiles", "2",
+                                    "-bf_delta_qp", "0",
+                                    "-refs", "2"
+                                )
+                                valid = $true
+                            }
+                        }
+                        else {
+                            Get-CPUEncoder -codec $codec
+                        }
+                        break
+                    }
+                }
+                break
+            }
+            'intel' {
+                $encoderConfig = switch ($codec) {
+                    'h264' {
+                        $intel = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Intel*" }
+                        Write-Host "GPU Detected: $($intel.Caption)" -ForegroundColor Green
+                        Write-Host "Using QuickSync encoder (h264_qsv)" -ForegroundColor Green
+                        @{
+                            hwaccel = "qsv"
+                            hwaccel_output_format = "nv12"
+                            decoder = "h264_qsv"
+                            encoder = "h264_qsv"
+                            scale_filter = "scale"
+                            preset = "veryslow"
+                            valid = $true
+                        }
+                        break
+                    }
+                    'av1' {
+                        $intel = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Arc*" }
+                        if ($intel) {
+                            Write-Host "GPU Detected: $($intel.Caption) with AV1 support" -ForegroundColor Green
+                            Write-Host "Using QuickSync AV1 encoder (av1_qsv)" -ForegroundColor Green
+                            @{
+                                hwaccel = "qsv"
+                                hwaccel_output_format = "nv12"
+                                decoder = "av1_qsv"
+                                encoder = "av1_qsv"
+                                scale_filter = "scale"
+                                preset = "veryslow"
+                                extra_params = @("-look_ahead", "32", "-tile_cols", "2")
+                                valid = $true
+                            }
+                        }
+                        else {
+                            Get-CPUEncoder -codec $codec
+                        }
+                        break
+                    }
+                }
+                break
+            }
+            default {
+                $encoderConfig = Get-CPUEncoder -codec $codec
+                break
+            }
+        }
+        
+        # Validate encoder configuration
+        if ($null -eq $encoderConfig -or -not $encoderConfig.valid) {
+            Write-Host "Invalid encoder configuration detected. Falling back to CPU..." -ForegroundColor Yellow
+            return Get-CPUEncoder -codec $codec
+        }
+        
+        return $encoderConfig
+    }
+    catch {
+        Write-Host "Error in GPU encoder selection: $_" -ForegroundColor Red
+        return Get-CPUEncoder -codec $codec
+    }
+}
+
+function Get-VideoInfo {
+    param([string]$inputFile)
+    
+    try {
+        $videoInfo = & ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate -of json $inputFile | ConvertFrom-Json
+        $duration = & ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 $inputFile
+        
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to get video information"
+        }
+
+        return @{
+            width = $videoInfo.streams[0].width
+            height = $videoInfo.streams[0].height
+            fps = [math]::Round([decimal]($videoInfo.streams[0].r_frame_rate -split '/')[0] / ($videoInfo.streams[0].r_frame_rate -split '/')[1], 2)
+            duration = [math]::Floor([double]$duration)
+        }
+    }
+    catch {
+        Write-Host "Error getting video information: $_" -ForegroundColor Red
+        throw
+    }
+}
+
+function Get-CompressionSettings {
+    param($videoInfo)
+    
+    try {
+        # Determine target FPS based on duration
+        $duration = $videoInfo.duration
+        $target_fps = if ($duration -gt 240) { 15 }
+                     elseif ($duration -gt 80) { 24 }
+                     elseif ($duration -gt 40) { 30 }
+                     else { 60 }
+
+        # Calculate target resolution based on duration
+        $target_height = if ($duration -gt 600) { 480 }        # > 10 minutes
+                        elseif ($duration -gt 300) { 540 }     # > 5 minutes
+                        elseif ($duration -gt 120) { 620 }     # > 2 minutes
+                        elseif ($duration -gt 20) { 720 }      # > 20 seconds
+                        elseif ($duration -gt 10) { 1080 }     # > 10 seconds
+                        else { $videoInfo.height }             # <= 10 seconds - keep original
+
+        # Calculate bitrates
+        $MAX_SIZE_BYTES = 10485760 * 0.93  # 93% of 10MB
+        $MIN_AUDIO_BITRATE = 48
+        
+        $total_available_bytes = $MAX_SIZE_BYTES
+        $audio_bytes = $duration * $MIN_AUDIO_BITRATE * 1000 / 8
+        $video_bytes = $total_available_bytes - $audio_bytes
+        $video_bitrate = [Math]::Floor(($video_bytes * 8) / $duration / 1000 * 0.97)
+        
+        Write-Host "`nCompression Settings:" -ForegroundColor Cyan
+        Write-Host "Target Resolution: $($target_height)p"
+        Write-Host "Target Framerate: $target_fps FPS"
+        Write-Host "Video Bitrate: $video_bitrate kbps"
+        Write-Host "Audio Bitrate: $MIN_AUDIO_BITRATE kbps"
+        
+        return @{
+            target_fps = $target_fps
+            target_height = $target_height
+            video_bitrate = $video_bitrate
+            audio_bitrate = $MIN_AUDIO_BITRATE
+        }
+    }
+    catch {
+        Write-Host "Error calculating compression settings: $_" -ForegroundColor Red
+        throw
+    }
+}
+
+function BuildFFmpegCommand {
+    param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$gpu,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$inputFile,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$outputFile,
+        
+        [Parameter(Mandatory=$true)]
+        [hashtable]$compressionSettings,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$inputCodec
+    )
+    
+    $ffmpeg_args = [System.Collections.ArrayList]@()
+    
+    # Global options
+    $ffmpeg_args.Add("-y") > $null                           # Overwrite output file without asking
+    $ffmpeg_args.Add("-hide_banner") > $null                 # Hide FFmpeg compilation info
+    
+    # Input options
+    if ($gpu.hwaccel) {
+        $ffmpeg_args.Add("-hwaccel") > $null
+        $ffmpeg_args.Add($gpu.hwaccel) > $null
+        
+        if ($gpu.hwaccel_output_format) {
+            $ffmpeg_args.Add("-hwaccel_output_format") > $null
+            $ffmpeg_args.Add($gpu.hwaccel_output_format) > $null
+        }
+    }
+    
+    # Input file
+    $ffmpeg_args.Add("-i") > $null
+    $ffmpeg_args.Add($inputFile) > $null
+    
+    # Video encoding options
+    $ffmpeg_args.Add("-c:v") > $null
+    $ffmpeg_args.Add($gpu.encoder) > $null
+    
+    # Two-pass encoding parameters
+    $ffmpeg_args.Add("-pass") > $null
+    $ffmpeg_args.Add("2") > $null        # Second pass
+    
+    # Encoding preset
+    $ffmpeg_args.Add("-preset") > $null
+    $ffmpeg_args.Add($gpu.preset) > $null
+    
+    # Video bitrate
+    $ffmpeg_args.Add("-b:v") > $null
+    $ffmpeg_args.Add([string]$compressionSettings.video_bitrate + "k") > $null
+    
+    # Max bitrate (1.5x target for VBV buffer)
+    $maxBitrate = [math]::Floor($compressionSettings.video_bitrate * 1.5)
+    $ffmpeg_args.Add("-maxrate") > $null
+    $ffmpeg_args.Add([string]$maxBitrate + "k") > $null
+    $ffmpeg_args.Add("-bufsize") > $null
+    $ffmpeg_args.Add([string]$maxBitrate + "k") > $null
+    
+    # Frame rate
+    if ($compressionSettings.target_fps -lt 60) {
+        $ffmpeg_args.Add("-r") > $null
+        $ffmpeg_args.Add($compressionSettings.target_fps) > $null
+    }
+    
+    # Resolution scaling
+    if ($gpu.scale_filter -eq "scale_cuda") {
+        $ffmpeg_args.Add("-vf") > $null
+        $ffmpeg_args.Add("$($gpu.scale_filter)=w=-2:h=$($compressionSettings.target_height)") > $null
+    } else {
+        $ffmpeg_args.Add("-vf") > $null
+        $ffmpeg_args.Add("$($gpu.scale_filter)=-2:$($compressionSettings.target_height)") > $null
+    }
+    
+    # GOP size (2 seconds worth of frames)
+    $gopSize = [math]::Floor($compressionSettings.target_fps * 2)
+    $ffmpeg_args.Add("-g") > $null
+    $ffmpeg_args.Add($gopSize) > $null
+    
+    # Audio encoding options
+    $ffmpeg_args.Add("-c:a") > $null
+    $ffmpeg_args.Add("aac") > $null
+    $ffmpeg_args.Add("-b:a") > $null
+    $ffmpeg_args.Add([string]$compressionSettings.audio_bitrate + "k") > $null
+    
+    # Add extra encoder-specific parameters if they exist
+    if ($gpu.extra_params) {
+        foreach ($param in $gpu.extra_params) {
+            $ffmpeg_args.Add($param) > $null
+        }
+    }
+    
+    # Output options
+    $ffmpeg_args.Add("-movflags") > $null
+    $ffmpeg_args.Add("+faststart") > $null    # Enable streaming-friendly output
+    
+    # Output file
+    $ffmpeg_args.Add($outputFile) > $null
+    
+    return $ffmpeg_args
+}
+
+# Main execution block
+
 try {
+    # Verify requirements first
+    if (-not (Test-Requirements)) {
+        throw "Failed requirements check"
+    }
+    
     $startTime = Get-Date
     
-    # Constants - using 93% of 10MB as target
-    $MAX_SIZE_BYTES = 10485760 * 0.93
-    
-    # Set encoding parameters
-    $MIN_AUDIO_BITRATE = 48
-    
-    # First get the input codec
+    # Get input codec
     $inputCodec = Get-VideoCodec -inputFile $inputFile
     Write-Host "`nInput Video Codec: $inputCodec" -ForegroundColor Cyan
     
-    # Get GPU encoder settings with codec information
+    # Get GPU encoder settings
     $gpu = Get-GPUEncoder -codec $inputCodec
     
-    # Set codec-specific parameters
-    if ($inputCodec -eq "av1") {
-        $TUNE = "ssim"       # Visual quality tuning for AV1
-        $PROFILE = "main"    # AV1 main profile
-    } else {
-        $TUNE = "hq"        # High quality tuning for H264
-        $PROFILE = "high"   # H264 high profile
-    }
-    
     # Get video information
-    $videoInfo = & ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate -of json $inputFile | ConvertFrom-Json
-    $width = $videoInfo.streams[0].width
-    $height = $videoInfo.streams[0].height
-    $originalFps = [math]::Round([decimal]($videoInfo.streams[0].r_frame_rate -split '/')[0] / ($videoInfo.streams[0].r_frame_rate -split '/')[1], 2)
+    $videoInfo = Get-VideoInfo -inputFile $inputFile
     
     Write-Host "`nInput Video Details:" -ForegroundColor Cyan
-    Write-Host "Resolution: ${width}x${height}"
-    Write-Host "Framerate: $originalFps FPS"
+    Write-Host "Resolution: $($videoInfo.width)x$($videoInfo.height)"
+    Write-Host "Framerate: $($videoInfo.fps) FPS"
+    Write-Host "Duration: $($videoInfo.duration) seconds"
     
-    # Get video duration
-    $duration = & ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 $inputFile
-    $duration_int = [math]::Floor([double]$duration)
+    # Calculate compression settings
+    $compressionSettings = Get-CompressionSettings -videoInfo $videoInfo
     
-    # Determine target FPS based on duration
-    if ($duration_int -gt 240) {
-        $target_fps = 15
-    } elseif ($duration_int -gt 80) {
-        $target_fps = 24
-    } elseif ($duration_int -gt 40) {
-        $target_fps = 30
-    } else {
-        $target_fps = 60
-    }
-    
-    # Calculate target resolution based on duration
-    if ($duration_int -gt 600) {      # > 10 minutes
-        $target_height = 480
-    } elseif ($duration_int -gt 300) { # > 5 minutes
-        $target_height = 540
-    } elseif ($duration_int -gt 120) { # > 2 minutes
-        $target_height = 620
-    } elseif ($duration_int -gt 20) {  # > 20 seconds
-        $target_height = 720
-    } elseif ($duration_int -gt 10) {  # > 10 seconds
-        $target_height = 1080
-    } else {                           # <= 10 seconds
-        $target_height = $height
-    }
-    
-    # Include FPS adjustment in scale filter
-    $SCALE = "-vf `"$($gpu.scale_filter)=-2:$target_height,fps=$target_fps`""
-
-    # Calculate bitrates
-    $total_available_bytes = $MAX_SIZE_BYTES
-    $audio_bytes = ($duration_int * $MIN_AUDIO_BITRATE * 1000 / 8)
-    $video_bytes = $total_available_bytes - $audio_bytes
-    $video_bitrate = [math]::Floor(($video_bytes * 8) / $duration_int / 1000 * 0.97)
-
     Write-Host "`nCompression Settings:" -ForegroundColor Cyan
-    Write-Host "Target Resolution: ${target_height}p"
-    Write-Host "Target Framerate: $target_fps FPS"
-    Write-Host "Video Bitrate: $video_bitrate kbps"
-    Write-Host "Audio Bitrate: $MIN_AUDIO_BITRATE kbps"
+    Write-Host "Target Resolution: $($compressionSettings.target_height)p"
+    Write-Host "Target Framerate: $($compressionSettings.target_fps) FPS"
+    Write-Host "Video Bitrate: $($compressionSettings.video_bitrate) kbps"
+    Write-Host "Audio Bitrate: $($compressionSettings.audio_bitrate) kbps"
     Write-Host "Using encoder: $($gpu.encoder)`n"
-
-    # Create output filename with codec-specific extension
-    $output_file = [System.IO.Path]::GetDirectoryName($inputFile) + "\" + 
-                  [System.IO.Path]::GetFileNameWithoutExtension($inputFile) + 
-                  "_compressed.mp4"  # Keep mp4 as it supports both h264 and av1
-
-    # Build ffmpeg command
-    $ffmpeg_args = @(
-        "-y",
-        "-loglevel", "error",
-        "-stats"
+    
+    # Create output filename
+    $output_file = [System.IO.Path]::Combine(
+        [System.IO.Path]::GetDirectoryName($inputFile),
+        [System.IO.Path]::GetFileNameWithoutExtension($inputFile) + "_compressed.mp4"
     )
+    
+    # Build and execute FFmpeg commands, for first and second passes:
+    
+   # Build FFmpeg command
+    $ffmpeg_args = BuildFFmpegCommand -gpu $gpu -inputFile $inputFile -outputFile $output_file `
+    -compressionSettings $compressionSettings -inputCodec $inputCodec
 
-    # Add hardware acceleration if available
-    if ($gpu.hwaccel) {
-        $ffmpeg_args += @(
-            "-hwaccel", $gpu.hwaccel
-        )
-        if ($gpu.hwaccel_output_format) {
-            $ffmpeg_args += @(
-                "-hwaccel_output_format", $gpu.hwaccel_output_format
-            )
-        }
+    # First pass
+    $firstpass_args = New-Object System.Collections.ArrayList
+    $firstpass_args.AddRange($ffmpeg_args)
+
+    # Remove the last element (output file)
+    $firstpass_args.RemoveAt($firstpass_args.Count - 1)
+
+    # Change pass number
+    $index = $firstpass_args.IndexOf("-pass")
+    if ($index -ge 0) {
+        $firstpass_args[$index + 1] = "1"  # Set to pass 1
     }
 
-    # Add input decoder and file
-    $ffmpeg_args += @(
-        "-c:v", $gpu.decoder,
-        "-i", $inputFile,
-        "-c:v", $gpu.encoder,
-        "-preset", $gpu.preset
-    )
+    # Add format and null output for Windows
+    $firstpass_args.Add("-f") > $null
+    $firstpass_args.Add("null") > $null
+    $firstpass_args.Add("nul") > $null  # Windows null device, lowercase without colon
 
-    # Add codec-specific encoding parameters
-    if ($inputCodec -eq "av1") {
-        if ($gpu.extra_params) {
-            foreach ($param in $gpu.extra_params) {
-                $ffmpeg_args += $param
-            }
-        }
-        # Add specific libaom-av1 quality parameters when using CPU encoding
-        if ($gpu.encoder -eq "libaom-av1") {
-            $ffmpeg_args += @(
-                "-strict", "experimental",
-                "-quality", "good",
-                "-crf", "30"  # Adjust CRF value between 0-63 for quality (lower is better)
-            )
-        }
-    } else {
-        $ffmpeg_args += @(
-            "-tune", $TUNE,
-            "-rc", "cbr",
-            "-profile:v", $PROFILE
-        )
+    Write-Host "Running first pass..."
+    & ffmpeg $firstpass_args
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "FFmpeg first pass encoding failed with exit code $LASTEXITCODE"
     }
-
-    # Add common encoding parameters
-    $ffmpeg_args += @(
-        "-b:v", "${video_bitrate}k",
-        "-maxrate", "${video_bitrate}k",
-        "-minrate", "${video_bitrate}k",
-        "-bufsize", "${video_bitrate}k"
-    )
-
-    # Add scaling and fps adjustment
-    if ($SCALE) {
-        $ffmpeg_args += $SCALE.Split(" ")
-    }
-
-    # Add audio settings
-    $ffmpeg_args += @(
-        "-c:a", "aac",
-        "-b:a", "${MIN_AUDIO_BITRATE}k",
-        "-movflags", "+faststart",
-        $output_file
-    )
-
-    # Execute ffmpeg
-    Write-Host "Compressing video and audio..."
+    # Second pass (using original ffmpeg_args which already has pass 2)
+    Write-Host "Running second pass..."
     & ffmpeg $ffmpeg_args
     
+    # Verify results
     $endTime = Get-Date
     $processingTime = ($endTime - $startTime).TotalSeconds
-
-    # Get final video info
+    
     $finalVideoInfo = & ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,bit_rate -of json $output_file | ConvertFrom-Json
+    
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to get final video information"
+    }
+    
     $finalBitrate = [math]::Round([int]$finalVideoInfo.streams[0].bit_rate / 1000)
     $finalFps = [math]::Round([decimal]($finalVideoInfo.streams[0].r_frame_rate -split '/')[0] / ($finalVideoInfo.streams[0].r_frame_rate -split '/')[1], 2)
     
-    # Verify final size and show results
     $final_size_mb = (Get-Item $output_file).Length/1024/1024
     $original_size_mb = (Get-Item $inputFile).Length/1024/1024
+    
     Write-Host "`nCompression Results:" -ForegroundColor Cyan
     Write-Host "Time taken: $([math]::Round($processingTime, 2)) seconds"
     Write-Host "Original size: $($original_size_mb.ToString('0.00')) MB"
@@ -392,16 +591,22 @@ try {
     Write-Host "Final framerate: $finalFps FPS"
     Write-Host "Final video bitrate: $finalBitrate kbps"
     Write-Host "Output saved as: $output_file"
-
+    
     if ($final_size_mb -gt 10) {
-        Write-Host "`nError!: File size exceeds 10MB limit! No video output file was made." -ForegroundColor Red
-        Remove-Item $output_file
+        Write-Host "`nError: File size exceeds 10MB limit! Removing output file..." -ForegroundColor Red
+        Remove-Item $output_file -ErrorAction SilentlyContinue
+        throw "Final file size exceeds 10MB limit"
     }
 }
 catch {
-    Write-Host "`nAn error occurred:"
-    Write-Host $_
+    Write-Host "`nAn error occurred:" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host "Stack Trace:" -ForegroundColor Red
+    Write-Host $_.ScriptStackTrace -ForegroundColor Red
 }
-
-Write-Host "`nWindow will stay open for 100000 seconds. Press Ctrl+C to close immediately..."
-Start-Sleep -Seconds 100000;
+finally {
+    Write-Host "`nPress Ctrl+C to exit..." -ForegroundColor Yellow
+    while ($true) {
+        Start-Sleep -Seconds 10000
+    }
+}
