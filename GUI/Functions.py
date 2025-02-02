@@ -1,12 +1,8 @@
+from PyQt6.QtWidgets import *
+from PyQt6.QtCore import *
+from PyQt6.QtMultimedia import *
+from PyQt6.QtMultimediaWidgets import *
 
-class Functions():
-    def openFile():
-        fileName, _ = QFileDialog.getOpenFileName(self, "Open Movie",
-                QDir.homePath())
-
-        if fileName != '':
-            self.mediaPlayer.setMedia(
-                    QMediaContent(QUrl.fromLocalFile(fileName)))
-            self.playButton.setEnabled(True)
-
-        return fileName
+def openFile():
+    fileName, _ = QFileDialog.getOpenFileName(directory = QDir.homePath())
+    return fileName
