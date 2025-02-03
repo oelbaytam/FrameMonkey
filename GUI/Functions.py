@@ -6,3 +6,4 @@ from PyQt6.QtMultimediaWidgets import *
 def openFile():
     fileName, _ = QFileDialog.getOpenFileName(directory = QDir.homePath())
     return fileName
+

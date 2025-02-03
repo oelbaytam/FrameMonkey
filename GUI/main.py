@@ -11,58 +11,62 @@ import os
 class MainWindow(QMainWindow):
     def __init__(self, inputFile=None):
         super().__init__()
-    
-        self.setFixedSize(QSize(550, 570))
+        # TODO: make video player size scale with main display resolution, so that it can be alot bigger
+        # TODO: add resizable main tab
+        self.setFixedSize(QSize(1920, 1080))
         self.setWindowTitle("FrameMonkey")
 
         layout = QGridLayout()
 
         # Input File Component
         #
-        
-        fileNameLabel = QLabel(inputFile)
+        self.fileNameLabel = QLabel(inputFile)
         browseFileBtn = QPushButton("Browse")
+        browseFileBtn.clicked.connect(self.handleFileOpen)
 
-        browseFileBtn.clicked.connect(openFile)
-
-        layout.addWidget(fileNameLabel, 0, 0, 0, 5)
+        layout.addWidget(self.fileNameLabel, 0, 0, 1, 5)
         layout.addWidget(browseFileBtn, 0, 6)
 
         # Video Player Component
         #
         currentLabel = QLabel("Current Time")
         currentVidTime = QLineEdit()
-        
-        player = QMediaPlayer()
-        player.setSource(QUrl.fromLocalFile(inputFile))
-        videoWidget = QVideoWidget()
-        videoWidget.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
-        player.setVideoOutput(videoWidget)
-        player.play()
+
+        self.player = QMediaPlayer()
+        self.videoWidget = QVideoWidget()
+        self.player.setVideoOutput(self.videoWidget)
+        self.videoWidget.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
+
+        # Add play/pause button
+        self.playButton = QPushButton("Play/Pause")
+        self.playButton.clicked.connect(self.togglePlayback)
 
         startLabel = QLabel("Start Time")
-        startTimeTrim = QLineEdit() 
+        startTimeTrim = QLineEdit()
         stopLabel = QLabel("Stop Time")
         stopTimeTrim = QLineEdit()
 
-        layout.addWidget(videoWidget, 1, 0, 8, 7)
+        layout.addWidget(self.videoWidget, 1, 0, 4, 7)
+        # Move play button below video widget
+        layout.addWidget(self.playButton, 5, 3)  # Changed from 2,3 to 5,3
+
         layout.addWidget(currentLabel, 2, 0)
         layout.addWidget(startLabel, 2, 1)
         layout.addWidget(stopLabel, 2, 2)
 
-        layout.addWidget(currentVidTime, 3, 0)        
+        layout.addWidget(currentVidTime, 3, 0)
         layout.addWidget(startTimeTrim, 3, 1)
-        layout.addWidget(stopTimeTrim, 3 , 2)
+        layout.addWidget(stopTimeTrim, 3, 2)
 
         # Checkbox Component
         #
-
         trimVideo = QCheckBox()
         trimVideoLabel = QLabel("Trim Video")
         twoPass = QCheckBox()
         twoPassLabel = QLabel("Encode Two Passes")
         hwAccel = QCheckBox()
-        hwAccelLabel = QLabel("Enable Hardware Acceleration")
+        hwAccel.setChecked(True)
+        hwAccelLabel = QLabel("Enable Hardware Acceleration (Default)")
 
         layout.addWidget(trimVideo, 4, 0)
         layout.addWidget(trimVideoLabel, 4, 1)
@@ -75,14 +79,18 @@ class MainWindow(QMainWindow):
 
         # Quality Select Component
         #
-
         sizeLabel = QLabel("Size")
-        fileSize = QLineEdit()
+        fileSize = QLineEdit("10")
         MBLabel = QLabel("MB")
 
+        # Disable the size-related widgets
+        sizeLabel.setEnabled(False)
+        fileSize.setEnabled(False)
+        MBLabel.setEnabled(False)
+
         qualityLabel = QLabel("Quality")
-        encodingSpeed = QLineEdit()
-        qinfoLabel = QLabel("1-Fast & poor, 6-Slow & good")
+        encodingSpeed = QLineEdit("6")  # Set default value to 6
+        qinfoLabel = QLabel("1-Faster, 6-Slower (6 Default)")
 
         layout.addWidget(sizeLabel, 7, 0)
         layout.addWidget(fileSize, 7, 1)
@@ -94,29 +102,41 @@ class MainWindow(QMainWindow):
 
         # File Save Component
         #
-
         saveFileName = QLineEdit(inputFile)
         saveBtn = QPushButton("Save")
 
-        layout.addWidget(saveFileName, 9, 0, 9, 5)
+        layout.addWidget(saveFileName, 9, 0, 1, 5)
         layout.addWidget(saveBtn, 9, 6)
 
-        # End of Components
-        #
+        # Error handling
+        self.player.errorOccurred.connect(self.handleError)
 
+        # Container setup
         container = QWidget()
         container.setLayout(layout)
-
         self.setCentralWidget(container)
+
+    def handleFileOpen(self):
+        fileName = openFile()
+        if fileName:
+            self.fileNameLabel.setText(fileName)
+            self.player.setSource(QUrl.fromLocalFile(fileName))
+            self.player.play()
+
+    def togglePlayback(self):
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+
+    def handleError(self, error, errorString):
+        if error != QMediaPlayer.Error.NoError:
+            QMessageBox.warning(self, "Media Error", f"Error playing media: {errorString}")
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-
-    #apply material stylesheet
     apply_stylesheet(app, theme='dark_yellow.xml')
-
     window = MainWindow(inputFile=os.getcwd())
     window.show()
-    
     app.exec()
