@@ -3,13 +3,15 @@
 
 -----TODO (in no particular order):-----
 
+ - Add cropping functionality, and restructure ps1 file to work with simple input values
+
  - add variable frame frate
 
  - Support for multiple audio/video tracks - there is an nvidia shadowplay setting to seperate mic and desktop audio, this needs to be accounted for and they need to be squished into one
 
  - add easier to control thresholds for target resolution, fps, when vfr is enabled, etc
 
- - more robust video length scaling , maybe also check file size
+ - more robust video length scaling , maybe also check file size - This will take forever
 
 
 -----Code is now in format as follows:-----
