@@ -1,0 +1,27 @@
+# JetBrains IDE
+.idea/
+*.xml
+editor.xml
+misc.xml
+vcs.xml
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# CMake build files
+cmake-build-debug/
+CMakeFiles/
+*.txt.user
+
+# Build and debug logs
+*Debug*.txt
+
+# Local todo files
+todo.txt
+
+# Keep these files
+!LICENSE
+!README.md
