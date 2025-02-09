@@ -1,22 +1,40 @@
 # This is a compression method that scales resolution and framerate with the length of the video it is compressing, below are the thresholds for the resolution and framerate:
 
-# Resolution:
-# - Videos longer than 10 minutes will be scaled to 480p
-# - Videos longer than 5 minutes will be scaled to 540p
-# - Videos longer than 2 minutes will be scaled to 620p
-# - Videos longer than 20 seconds will be scaled to 720p
-# - Videos shorter than 20 seconds will be scaled to 1080p
-# - Videos shorter than 10 seconds will maintain their native resolution
-
-# Framerate:
-# - Videos longer than 1 minute and 20 seconds will be compressed to 24fps
-# - Videos longer than 40 seconds will be compressed to 30fps
-# - Videos shorter than 40 seconds will maintain their native framerate
-
 param(
     [Parameter(Mandatory=$true)]
-    [string]$inputFile
+    [string]$inputFile,
+    
+    [Parameter(Mandatory=$false)]
+    [int]$targetSizeMB = 50  # Default to 10MB if not specified
 )
+
+if ($Host.Name -eq "ConsoleHost") {
+    $host.UI.RawUI.WindowTitle = "Video Compression Tool"
+    # Keep window open even if there's an error
+    $ErrorActionPreference = "Stop"
+    trap {
+        Write-Host "`nAn error occurred:" -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor Red
+        Write-Host "`nPress any key to exit..." -ForegroundColor Yellow
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        exit 1
+    }
+}
+
+# Add window handling
+if ($Host.Name -eq "Windows PowerShell ISE Host") {
+    Write-Warning "Script is running in PowerShell ISE. Window closing prevention not needed."
+} else {
+    # Prevent the PowerShell window from closing
+    $Host.UI.RawUI.WindowTitle = "Video Compression Tool"
+    [Console]::TreatControlCAsInput = $true
+}
+
+# Function to handle script exit
+function Show-ExitPrompt {
+    Write-Host "`nPress any key to exit..." -ForegroundColor Yellow
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+}
 
 # Verify required tools are available
 function Test-Requirements {
@@ -44,6 +62,7 @@ function Test-Requirements {
         return $false
     }
 }
+
 # Function to determine which video codec the source file uses
 function Get-VideoCodec {
     param(
@@ -64,7 +83,7 @@ function Get-VideoCodec {
     }
 }
 
-# Helper function to detect GPU type with improved error handling
+# Helper function to detect GPU type with error handling
 function Get-GPUType {
     try {
         # Check for GPUs using WMI first
@@ -73,7 +92,7 @@ function Get-GPUType {
         # Check for AMD GPU first
         $amd = $gpus | Where-Object { $_.Caption -like "*Radeon*" }
         if ($amd) {
-            Write-Host "AMD GPU detected: $($amd.Caption)" -ForegroundColor Green
+            Write-Host "AMD GPU detected: $($amd.Caption)" -ForegroundColor DarkRed
             return 'amd'
         }
         
@@ -83,6 +102,7 @@ function Get-GPUType {
             # Only try nvidia-smi if we actually found an NVIDIA GPU
             $nvidiaSmi = & nvidia-smi --query-gpu=gpu_name --format=csv,noheader 2>$null
             if ($LASTEXITCODE -eq 0) {
+                Write-Host "Nvidia GPU Located: $($nvidiaSmi.Trim())" -ForegroundColor Green
                 return 'nvidia'
             }
         }
@@ -90,6 +110,7 @@ function Get-GPUType {
         # Finally check for Intel GPU
         $intel = $gpus | Where-Object { $_.Caption -like "*Intel*" }
         if ($intel) {
+            Write-Host "Intel GPU detected!" -ForegroundColor Blue
             return 'intel'
         }
     }
@@ -101,7 +122,6 @@ function Get-GPUType {
     return 'cpu' # Safe fallback
 }
 
-# Update the Get-CPUEncoder function
 function Get-CPUEncoder {
     param(
         [Parameter(Mandatory=$true)]
@@ -111,7 +131,10 @@ function Get-CPUEncoder {
     
     switch ($codec) {
         'h264' {
+            Write-Host "No compatible GPU found with encoding support for the given input video file type" -ForegroundColor Yellow
+            Write-Host "Falling back to CPU (Software) encoding..." -ForegroundColor Blue
             Write-Host "Using CPU encoder (libx264)" -ForegroundColor Yellow
+            Write-Host "THIS WILL BE MUCH SLOWER!" -ForegroundColor Red
             return @{
                 hwaccel = $null
                 hwaccel_output_format = $null
@@ -123,12 +146,14 @@ function Get-CPUEncoder {
             }
         }
         'av1' {
+            Write-Host "No compatible GPU found with encoding support for the given input video file type" -ForegroundColor Yellow
+            Write-Host "Falling back to CPU (Software) encoding..." -ForegroundColor Blue
             Write-Host "Using CPU-based AV1 encoder (libaom-av1)" -ForegroundColor Red
-            Write-Host "THIS WILL BE MUCH SLOWER!!!" -ForegroundColor Red
+            Write-Host "THIS WILL BE MUCH SLOWER!" -ForegroundColor Red
             return @{
                 hwaccel = $null
                 hwaccel_output_format = $null
-                decoder = "av1"  # Changed from libdav1d to av1
+                decoder = "av1"
                 encoder = "libaom-av1"
                 scale_filter = "scale"
                 preset = "5"
@@ -163,7 +188,7 @@ function Get-GPUEncoder {
             'nvidia' {
                 $encoderConfig = switch ($codec) {
                     'h264' {
-                        Write-Host "GPU Detected: NVIDIA with H264 support" -ForegroundColor Green
+                        Write-Host "Compatible GPU Detected: NVIDIA with H264 support" -ForegroundColor Green
                         Write-Host "Using NVENC encoder (h264_nvenc)" -ForegroundColor Green
                         @{
                             hwaccel = "cuda"
@@ -180,7 +205,7 @@ function Get-GPUEncoder {
                         # Check if GPU supports AV1 (RTX 40 series)
                         $nvidia = & nvidia-smi --query-gpu=gpu_name --format=csv,noheader 2>$null
                         if ($nvidia -like "*RTX 40*") {
-                            Write-Host "GPU Detected: NVIDIA $($nvidia.Trim()) with AV1 support" -ForegroundColor Green
+                            Write-Host "Compatible GPU Detected: NVIDIA $($nvidia.Trim()) with AV1 support" -ForegroundColor Green
                             Write-Host "Using NVENC AV1 encoder (av1_nvenc)" -ForegroundColor Green
                             @{
                                 hwaccel = "cuda"
@@ -205,7 +230,7 @@ function Get-GPUEncoder {
                 $encoderConfig = switch ($codec) {
                     'h264' {
                         $amdGpu = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Radeon*" }
-                        Write-Host "GPU Detected: $($amdGpu.Caption)" -ForegroundColor Green
+                        Write-Host "Compatible GPU Detected: $($amdGpu.Caption)" -ForegroundColor Green
                         Write-Host "Using AMF encoder (h264_amf)" -ForegroundColor Green
                         @{
                             hwaccel = "d3d11va"
@@ -220,9 +245,8 @@ function Get-GPUEncoder {
                     }
                     'av1' {
                         $amdGpu = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Radeon*" }
-                        # Updated regex pattern to match RX 7000 series
                         if ($amdGpu.Caption -match "RX\s+7\d{3}|RX\s*7\d{3}\s*XT") {
-                            Write-Host "GPU Detected: $($amdGpu.Caption) with AV1 support" -ForegroundColor Green
+                            Write-Host "Compatible GPU Detected: $($amdGpu.Caption) with AV1 support" -ForegroundColor Green
                             Write-Host "Using AMF AV1 encoder (av1_amf)" -ForegroundColor Green
                             @{
                                 hwaccel = "d3d11va"
@@ -237,7 +261,6 @@ function Get-GPUEncoder {
                                     "-rc", "vbr_latency",
                                     "-async_depth", "1",
                                     "-max_lab", "1",
-                                    # "-header_insertion_mode", "idr",
                                     "-gops_per_idr", "1",
                                     "-tiles", "2",
                                     "-bf_delta_qp", "0",
@@ -258,7 +281,7 @@ function Get-GPUEncoder {
                 $encoderConfig = switch ($codec) {
                     'h264' {
                         $intel = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Intel*" }
-                        Write-Host "GPU Detected: $($intel.Caption)" -ForegroundColor Green
+                        Write-Host "Compatible GPU Detected: $($intel.Caption)" -ForegroundColor Green
                         Write-Host "Using QuickSync encoder (h264_qsv)" -ForegroundColor Green
                         @{
                             hwaccel = "qsv"
@@ -274,7 +297,7 @@ function Get-GPUEncoder {
                     'av1' {
                         $intel = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Arc*" }
                         if ($intel) {
-                            Write-Host "GPU Detected: $($intel.Caption) with AV1 support" -ForegroundColor Green
+                            Write-Host "Compatible GPU Detected: $($intel.Caption) with AV1 support" -ForegroundColor Green
                             Write-Host "Using QuickSync AV1 encoder (av1_qsv)" -ForegroundColor Green
                             @{
                                 hwaccel = "qsv"
@@ -339,45 +362,128 @@ function Get-VideoInfo {
     }
 }
 
+function Get-CompressionThresholds {
+    param(
+        [Parameter(Mandatory=$true)]
+        [double]$compressionRatio
+    )
+    
+    # Base settings
+    $settings = @{
+        resolution = $null  # null means keep original
+        fps = $null        # null means keep original
+        quality_preset = "medium"
+    }
+    
+    # Apply thresholds based on compression ratio
+    switch ($compressionRatio) {
+        {$_ -le 1} {
+            Write-Host "Compression ratio <= 1, maintaining original quality" -ForegroundColor Green
+            return $settings
+        }
+        {$_ -le 3} {
+            Write-Host "Low compression ratio ($compressionRatio), applying basic compression" -ForegroundColor Green
+            $settings.quality_preset = "medium"
+            return $settings
+        }
+        {$_ -le 6} {
+            Write-Host "Medium compression ratio ($compressionRatio), scaling to 1080p" -ForegroundColor Yellow
+            $settings.resolution = 1080
+            return $settings
+        }
+        {$_ -le 10} {
+            Write-Host "High compression ratio ($compressionRatio), scaling to 1080p/30fps" -ForegroundColor Yellow
+            $settings.resolution = 1080
+            $settings.fps = 30
+            return $settings
+        }
+        {$_ -le 15} {
+            Write-Host "Very high compression ratio ($compressionRatio), scaling to 720p/30fps" -ForegroundColor Red
+            $settings.resolution = 720
+            $settings.fps = 30
+            return $settings
+        }
+        {$_ -le 20} {
+            Write-Host "Extreme compression ratio ($compressionRatio), scaling to 720p/24fps" -ForegroundColor Red
+            $settings.resolution = 720
+            $settings.fps = 24
+            return $settings
+        }
+        default {
+            Write-Host "Maximum compression ratio ($compressionRatio), scaling to 480p/24fps" -ForegroundColor Red
+            $settings.resolution = 480
+            $settings.fps = 24
+            return $settings
+        }
+    }
+}
+
+
 function Get-CompressionSettings {
-    param($videoInfo)
+    param(
+        $videoInfo,
+        [int]$targetSizeMB
+    )
     
     try {
-        # Determine target FPS based on duration
-        $duration = $videoInfo.duration
-        $target_fps = if ($duration -gt 240) { 15 }
-                     elseif ($duration -gt 80) { 24 }
-                     elseif ($duration -gt 40) { 30 }
-                     else { 60 }
-
-        # Calculate target resolution based on duration
-        $target_height = if ($duration -gt 600) { 480 }        # > 10 minutes
-                        elseif ($duration -gt 300) { 540 }     # > 5 minutes
-                        elseif ($duration -gt 120) { 620 }     # > 2 minutes
-                        elseif ($duration -gt 20) { 720 }      # > 20 seconds
-                        elseif ($duration -gt 10) { 1080 }     # > 10 seconds
-                        else { $videoInfo.height }             # <= 10 seconds - keep original
-
-        # Calculate bitrates
-        $MAX_SIZE_BYTES = 10485760 * 0.93  # 93% of 10MB
-        $MIN_AUDIO_BITRATE = 48
+        # Calculate original size in MB
+        $originalSizeMB = (Get-Item $inputFile).Length/1MB
+        $compressionRatio = $originalSizeMB / $targetSizeMB
         
-        $total_available_bytes = $MAX_SIZE_BYTES
-        $audio_bytes = $duration * $MIN_AUDIO_BITRATE * 1000 / 8
-        $video_bytes = $total_available_bytes - $audio_bytes
-        $video_bitrate = [Math]::Floor(($video_bytes * 8) / $duration / 1000 * 0.97)
+        Write-Host "`nCompression Analysis:" -ForegroundColor Cyan
+        Write-Host "Original Size: $($originalSizeMB.ToString('0.00')) MB"
+        Write-Host "Target Size: $targetSizeMB MB"
+        Write-Host "Compression Ratio Needed: $($compressionRatio.ToString('0.00')):1"
+        
+        # Get threshold-based settings
+        $thresholdSettings = Get-CompressionThresholds -compressionRatio $compressionRatio
+        
+        # Calculate target resolution and fps
+        $target_height = if ($null -ne $thresholdSettings.resolution) { [int]$thresholdSettings.resolution } else { [int]$videoInfo.height }
+        $target_fps = if ($null -ne $thresholdSettings.fps) { [int]$thresholdSettings.fps } else { [int]$videoInfo.fps }
+        
+        # Determine audio bitrate based on compression ratio
+        [int]$audio_bitrate = 64  # Default value
+        
+        if ($compressionRatio -le 20) {
+            try {
+                $audioStream = & ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of default=noprint_wrappers=1:nokey=1 $inputFile
+                if ($null -ne $audioStream -and $audioStream -ne '') {
+                    $audio_bitrate = [Math]::Max(48, [Math]::Floor([int]$audioStream / 1000))
+                }
+            } catch {
+                $audio_bitrate = 48
+            }
+        }
+        elseif ($compressionRatio -le 30) {
+            $audio_bitrate = 32
+        }
+        elseif ($compressionRatio -le 40) {
+            $audio_bitrate = 24
+        }
+        else {
+            $audio_bitrate = 16
+        }
+        
+        # Calculate video bitrate with more explicit steps
+        [double]$targetSizeBitsDouble = [double]$targetSizeMB * 8.0 * 1024.0 * 1024.0 * 0.93
+        [double]$durationDouble = [double]$videoInfo.duration
+        [double]$bitsPerSecondDouble = $targetSizeBitsDouble / $durationDouble
+        [int]$totalBitrateKbps = [Math]::Floor($bitsPerSecondDouble / 1000.0)
+        [int]$video_bitrate = [Math]::Max(100, $totalBitrateKbps - $audio_bitrate)
         
         Write-Host "`nCompression Settings:" -ForegroundColor Cyan
         Write-Host "Target Resolution: $($target_height)p"
         Write-Host "Target Framerate: $target_fps FPS"
         Write-Host "Video Bitrate: $video_bitrate kbps"
-        Write-Host "Audio Bitrate: $MIN_AUDIO_BITRATE kbps"
+        Write-Host "Audio Bitrate: $audio_bitrate kbps"
         
         return @{
             target_fps = $target_fps
             target_height = $target_height
             video_bitrate = $video_bitrate
-            audio_bitrate = $MIN_AUDIO_BITRATE
+            audio_bitrate = $audio_bitrate
+            quality_preset = $thresholdSettings.quality_preset
         }
     }
     catch {
@@ -438,11 +544,12 @@ function BuildFFmpegCommand {
     $ffmpeg_args.Add($gpu.preset) > $null
     
     # Video bitrate
+    $safe_bitrate = [Math]::Max(100, $compressionSettings.video_bitrate)
     $ffmpeg_args.Add("-b:v") > $null
-    $ffmpeg_args.Add([string]$compressionSettings.video_bitrate + "k") > $null
+    $ffmpeg_args.Add([string]$safe_bitrate + "k") > $null
     
     # Max bitrate (1.5x target for VBV buffer)
-    $maxBitrate = [math]::Floor($compressionSettings.video_bitrate * 1.5)
+    $maxBitrate = [Math]::Max(150, [math]::Floor($safe_bitrate * 1.5))
     $ffmpeg_args.Add("-maxrate") > $null
     $ffmpeg_args.Add([string]$maxBitrate + "k") > $null
     $ffmpeg_args.Add("-bufsize") > $null
@@ -491,8 +598,10 @@ function BuildFFmpegCommand {
     return $ffmpeg_args
 }
 
-# Main execution block
+# Initialize exit code
+$exitCode = 0
 
+# Main try-catch block for the entire script
 try {
     # Verify requirements first
     if (-not (Test-Requirements)) {
@@ -517,7 +626,7 @@ try {
     Write-Host "Duration: $($videoInfo.duration) seconds"
     
     # Calculate compression settings
-    $compressionSettings = Get-CompressionSettings -videoInfo $videoInfo
+    $compressionSettings = Get-CompressionSettings -videoInfo $videoInfo -targetSizeMB $targetSizeMB
     
     Write-Host "`nCompression Settings:" -ForegroundColor Cyan
     Write-Host "Target Resolution: $($compressionSettings.target_height)p"
@@ -532,9 +641,7 @@ try {
         [System.IO.Path]::GetFileNameWithoutExtension($inputFile) + "_compressed.mp4"
     )
     
-    # Build and execute FFmpeg commands, for first and second passes:
-    
-   # Build FFmpeg command
+    # Build FFmpeg command
     $ffmpeg_args = BuildFFmpegCommand -gpu $gpu -inputFile $inputFile -outputFile $output_file `
     -compressionSettings $compressionSettings -inputCodec $inputCodec
 
@@ -554,7 +661,7 @@ try {
     # Add format and null output for Windows
     $firstpass_args.Add("-f") > $null
     $firstpass_args.Add("null") > $null
-    $firstpass_args.Add("nul") > $null  # Windows null device, lowercase without colon
+    $firstpass_args.Add("nul") > $null  # Windows null device
 
     Write-Host "Running first pass..."
     & ffmpeg $firstpass_args
@@ -562,6 +669,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "FFmpeg first pass encoding failed with exit code $LASTEXITCODE"
     }
+
     # Second pass (using original ffmpeg_args which already has pass 2)
     Write-Host "Running second pass..."
     & ffmpeg $ffmpeg_args
@@ -591,22 +699,40 @@ try {
     Write-Host "Final framerate: $finalFps FPS"
     Write-Host "Final video bitrate: $finalBitrate kbps"
     Write-Host "Output saved as: $output_file"
-    
-    if ($final_size_mb -gt 10) {
-        Write-Host "`nError: File size exceeds 10MB limit! Removing output file..." -ForegroundColor Red
+# Update the final size check in the main try block
+    if ($final_size_mb -gt $targetSizeMB) {
+        Write-Host "`nError: File size exceeds $targetSizeMB MB limit! Removing output file..." -ForegroundColor Red
         Remove-Item $output_file -ErrorAction SilentlyContinue
-        throw "Final file size exceeds 10MB limit"
+        throw "Final file size exceeds $targetSizeMB MB limit"
     }
-}
-catch {
-    Write-Host "`nAn error occurred:" -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Red
-    Write-Host "Stack Trace:" -ForegroundColor Red
-    Write-Host $_.ScriptStackTrace -ForegroundColor Red
-}
-finally {
-    Write-Host "`nPress Ctrl+C to exit..." -ForegroundColor Yellow
-    while ($true) {
-        Start-Sleep -Seconds 10000
+} catch {
+    # Enhanced error handling
+    Write-Host "`nError Details:" -ForegroundColor Red
+    Write-Host "----------------" -ForegroundColor Red
+    Write-Host "Error Message: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Error Type: $($_.Exception.GetType().FullName)" -ForegroundColor Red
+    Write-Host "Line Number: $($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor Red
+    Write-Host "Command: $($_.InvocationInfo.MyCommand)" -ForegroundColor Red
+    Write-Host "----------------" -ForegroundColor Red
+    
+    # In case of error, make sure we clean up any temporary files
+    Remove-Item "$env:TEMP\ffmpeg2pass*" -ErrorAction SilentlyContinue
+    
+    # Set failure exit code
+    $exitCode = 1
+} finally {
+    # Cleanup code
+    if (Test-Path "ffmpeg2pass-*.log") {
+        Remove-Item "ffmpeg2pass-*.log" -ErrorAction SilentlyContinue
     }
+    
+    if (Test-Path "ffmpeg2pass-*.log.mbtree") {
+        Remove-Item "ffmpeg2pass-*.log.mbtree" -ErrorAction SilentlyContinue
+    }
+    
+    # Show exit prompt and handle window closing
+    Show-ExitPrompt
+    
+    # Exit with appropriate code
+    exit $exitCode
 }
