@@ -3,14 +3,32 @@
 param(
     [Parameter(Mandatory=$true)]
     [string]$inputFile,
-    
+   
     [Parameter(Mandatory=$false)]
-    [int]$targetSizeMB = 50  # Default to 10MB if not specified
+    [int]$targetSizeMB = 10,  # Default to 10MB if not specified
+
+    [Parameter(Mandatory=$false)]
+    [int]$TrimStart = 0,  # NOT IN USE YET TODO: Default to 0 seconds if not specified
+
+    [Parameter(Mandatory=$false)]
+    [int]$TrimEnd = 0,  # NOT IN USE YET TODO: Default to 0 if not specified, if TrimEnd set to 0, the script will NOT crop and skip this step entirely
+
+    [Parameter(Mandatory=$false)]
+    [bool]$twoPassSet = $false,  # Set to true by default to enable two pass encoding
+
+    [Parameter(Mandatory=$false)]
+    [bool]$HardwareAccel = $true,  # NOT IN USE YET TODO Set to true by default to enable hardware acceleration
+
+    [Parameter(Mandatory=$false)]
+    [int]$QualitySetting = 6,  # NOT IN USE YET TODO Default to 6 if not specified
+
+    [Parameter(Mandatory=$false)]
+    [double]$FinalSizeSafetyRatio = 0.93  # NOT IN USE YET TODO This is the value that allows some extra space to ensure the output file stays under the specified target size Default to 0.93 if not specified, may need to be dropped for bigger input file sizes
 )
 
+#Keeping the window open in case of an error
 if ($Host.Name -eq "ConsoleHost") {
     $host.UI.RawUI.WindowTitle = "Video Compression Tool"
-    # Keep window open even if there's an error
     $ErrorActionPreference = "Stop"
     trap {
         Write-Host "`nAn error occurred:" -ForegroundColor Red
@@ -63,7 +81,7 @@ function Test-Requirements {
     }
 }
 
-# Function to determine which video codec the source file uses
+# Function to determine which video codec the source file uses, to determine if our script can handle it at all
 function Get-VideoCodec {
     param(
         [Parameter(Mandatory=$true)]
@@ -424,60 +442,64 @@ function Get-CompressionSettings {
         $videoInfo,
         [int]$targetSizeMB
     )
-    
+   
     try {
         # Calculate original size in MB
         $originalSizeMB = (Get-Item $inputFile).Length/1MB
         $compressionRatio = $originalSizeMB / $targetSizeMB
-        
+       
         Write-Host "`nCompression Analysis:" -ForegroundColor Cyan
         Write-Host "Original Size: $($originalSizeMB.ToString('0.00')) MB"
         Write-Host "Target Size: $targetSizeMB MB"
         Write-Host "Compression Ratio Needed: $($compressionRatio.ToString('0.00')):1"
-        
+       
         # Get threshold-based settings
         $thresholdSettings = Get-CompressionThresholds -compressionRatio $compressionRatio
-        
+       
         # Calculate target resolution and fps
         $target_height = if ($null -ne $thresholdSettings.resolution) { [int]$thresholdSettings.resolution } else { [int]$videoInfo.height }
         $target_fps = if ($null -ne $thresholdSettings.fps) { [int]$thresholdSettings.fps } else { [int]$videoInfo.fps }
-        
-        # Determine audio bitrate based on compression ratio
-        [int]$audio_bitrate = 64  # Default value
-        
-        if ($compressionRatio -le 20) {
-            try {
-                $audioStream = & ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of default=noprint_wrappers=1:nokey=1 $inputFile
-                if ($null -ne $audioStream -and $audioStream -ne '') {
-                    $audio_bitrate = [Math]::Max(48, [Math]::Floor([int]$audioStream / 1000))
-                }
-            } catch {
-                $audio_bitrate = 48
+       
+        # Get original audio bitrate
+        try {
+            $audioStream = & ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of default=noprint_wrappers=1:nokey=1 $inputFile
+            $originalAudioBitrate = if ($null -ne $audioStream -and $audioStream -ne '') {
+                [Math]::Floor([int]$audioStream / 1000)  # Convert to kbps
+            } else {
+                64  # Default if can't detect
             }
+        } catch {
+            $originalAudioBitrate = 64  # Default if error
+        }
+
+        # Determine audio bitrate based on compression ratio
+        [int]$audio_bitrate = if ($compressionRatio -le 20) {
+            # Keep original bitrate but ensure it's at least 48kbps
+            [Math]::Max(48, $originalAudioBitrate)
         }
         elseif ($compressionRatio -le 30) {
-            $audio_bitrate = 32
+            32
         }
         elseif ($compressionRatio -le 40) {
-            $audio_bitrate = 24
+            24
         }
         else {
-            $audio_bitrate = 16
+            16
         }
-        
+       
         # Calculate video bitrate with more explicit steps
-        [double]$targetSizeBitsDouble = [double]$targetSizeMB * 8.0 * 1024.0 * 1024.0 * 0.93
+        [double]$targetSizeBitsDouble = [double]$targetSizeMB * 8.0 * 1024.0 * 1024.0 * 0.92
         [double]$durationDouble = [double]$videoInfo.duration
         [double]$bitsPerSecondDouble = $targetSizeBitsDouble / $durationDouble
         [int]$totalBitrateKbps = [Math]::Floor($bitsPerSecondDouble / 1000.0)
         [int]$video_bitrate = [Math]::Max(100, $totalBitrateKbps - $audio_bitrate)
-        
+       
         Write-Host "`nCompression Settings:" -ForegroundColor Cyan
         Write-Host "Target Resolution: $($target_height)p"
         Write-Host "Target Framerate: $target_fps FPS"
         Write-Host "Video Bitrate: $video_bitrate kbps"
-        Write-Host "Audio Bitrate: $audio_bitrate kbps"
-        
+        Write-Host "Audio Bitrate: $audio_bitrate kbps (Original: $originalAudioBitrate kbps)"
+       
         return @{
             target_fps = $target_fps
             target_height = $target_height
@@ -496,16 +518,12 @@ function BuildFFmpegCommand {
     param(
         [Parameter(Mandatory=$true)]
         [hashtable]$gpu,
-        
         [Parameter(Mandatory=$true)]
         [string]$inputFile,
-        
         [Parameter(Mandatory=$true)]
         [string]$outputFile,
-        
         [Parameter(Mandatory=$true)]
         [hashtable]$compressionSettings,
-        
         [Parameter(Mandatory=$true)]
         [string]$inputCodec
     )
@@ -513,8 +531,8 @@ function BuildFFmpegCommand {
     $ffmpeg_args = [System.Collections.ArrayList]@()
     
     # Global options
-    $ffmpeg_args.Add("-y") > $null                           # Overwrite output file without asking
-    $ffmpeg_args.Add("-hide_banner") > $null                 # Hide FFmpeg compilation info
+    $ffmpeg_args.Add("-y") > $null
+    $ffmpeg_args.Add("-hide_banner") > $null
     
     # Input options
     if ($gpu.hwaccel) {
@@ -534,10 +552,6 @@ function BuildFFmpegCommand {
     # Video encoding options
     $ffmpeg_args.Add("-c:v") > $null
     $ffmpeg_args.Add($gpu.encoder) > $null
-    
-    # Two-pass encoding parameters
-    $ffmpeg_args.Add("-pass") > $null
-    $ffmpeg_args.Add("2") > $null        # Second pass
     
     # Encoding preset
     $ffmpeg_args.Add("-preset") > $null
@@ -590,18 +604,58 @@ function BuildFFmpegCommand {
     
     # Output options
     $ffmpeg_args.Add("-movflags") > $null
-    $ffmpeg_args.Add("+faststart") > $null    # Enable streaming-friendly output
-    
-    # Output file
-    $ffmpeg_args.Add($outputFile) > $null
+    $ffmpeg_args.Add("+faststart") > $null
     
     return $ffmpeg_args
 }
 
-# Initialize exit code
-$exitCode = 0
+function RunFFmpegCommand {
+    param(
+        [Parameter(Mandatory=$true)]
+        [System.Collections.ArrayList]$ffmpeg_args,
+        [Parameter(Mandatory=$true)]
+        [bool]$twoPassSet,
+        [Parameter(Mandatory=$true)]
+        [string]$outputFile
+    )
+    
+    if ($twoPassSet) {
+        Write-Host "Two-pass encoding enabled" -ForegroundColor Green
+        Write-Host "Running first pass..." -ForegroundColor Cyan
+        
+        # Add first pass specific parameters
+        $ffmpeg_args.Add("-pass") > $null
+        $ffmpeg_args.Add("1") > $null
+        $ffmpeg_args.Add("-f") > $null
+        $ffmpeg_args.Add("null") > $null
+        $ffmpeg_args.Add("nul") > $null
+        
+        & ffmpeg $ffmpeg_args
+        
+        if ($LASTEXITCODE -ne 0) {
+            throw "FFmpeg first pass encoding failed with exit code $LASTEXITCODE"
+        }
+        
+        # Modify for second pass
+        $ffmpeg_args.RemoveRange($ffmpeg_args.Count - 3, 3)  # Remove null output
+        $passIndex = $ffmpeg_args.IndexOf("-pass")
+        $ffmpeg_args[$passIndex + 1] = "2"
+        $ffmpeg_args.Add($outputFile) > $null
+        
+        Write-Host "Running second pass..." -ForegroundColor Cyan
+    } else {
+        Write-Host "Single-pass encoding mode..." -ForegroundColor Cyan
+        $ffmpeg_args.Add($outputFile) > $null
+    }
+    
+    & ffmpeg $ffmpeg_args
+    
+    if ($LASTEXITCODE -ne 0) {
+        throw "FFmpeg encoding failed with exit code $LASTEXITCODE"
+    }
+}
 
-# Main try-catch block for the entire script
+# Main execution block
 try {
     # Verify requirements first
     if (-not (Test-Requirements)) {
@@ -641,38 +695,11 @@ try {
         [System.IO.Path]::GetFileNameWithoutExtension($inputFile) + "_compressed.mp4"
     )
     
-    # Build FFmpeg command
+    # Build and run FFmpeg command
     $ffmpeg_args = BuildFFmpegCommand -gpu $gpu -inputFile $inputFile -outputFile $output_file `
-    -compressionSettings $compressionSettings -inputCodec $inputCodec
-
-    # First pass
-    $firstpass_args = New-Object System.Collections.ArrayList
-    $firstpass_args.AddRange($ffmpeg_args)
-
-    # Remove the last element (output file)
-    $firstpass_args.RemoveAt($firstpass_args.Count - 1)
-
-    # Change pass number
-    $index = $firstpass_args.IndexOf("-pass")
-    if ($index -ge 0) {
-        $firstpass_args[$index + 1] = "1"  # Set to pass 1
-    }
-
-    # Add format and null output for Windows
-    $firstpass_args.Add("-f") > $null
-    $firstpass_args.Add("null") > $null
-    $firstpass_args.Add("nul") > $null  # Windows null device
-
-    Write-Host "Running first pass..."
-    & ffmpeg $firstpass_args
-
-    if ($LASTEXITCODE -ne 0) {
-        throw "FFmpeg first pass encoding failed with exit code $LASTEXITCODE"
-    }
-
-    # Second pass (using original ffmpeg_args which already has pass 2)
-    Write-Host "Running second pass..."
-    & ffmpeg $ffmpeg_args
+        -compressionSettings $compressionSettings -inputCodec $inputCodec
+    
+    RunFFmpegCommand -ffmpeg_args $ffmpeg_args -twoPassSet $twoPassSet -outputFile $output_file
     
     # Verify results
     $endTime = Get-Date
@@ -699,14 +726,13 @@ try {
     Write-Host "Final framerate: $finalFps FPS"
     Write-Host "Final video bitrate: $finalBitrate kbps"
     Write-Host "Output saved as: $output_file"
-# Update the final size check in the main try block
+
     if ($final_size_mb -gt $targetSizeMB) {
         Write-Host "`nError: File size exceeds $targetSizeMB MB limit! Removing output file..." -ForegroundColor Red
         Remove-Item $output_file -ErrorAction SilentlyContinue
         throw "Final file size exceeds $targetSizeMB MB limit"
     }
 } catch {
-    # Enhanced error handling
     Write-Host "`nError Details:" -ForegroundColor Red
     Write-Host "----------------" -ForegroundColor Red
     Write-Host "Error Message: $($_.Exception.Message)" -ForegroundColor Red
@@ -715,13 +741,9 @@ try {
     Write-Host "Command: $($_.InvocationInfo.MyCommand)" -ForegroundColor Red
     Write-Host "----------------" -ForegroundColor Red
     
-    # In case of error, make sure we clean up any temporary files
     Remove-Item "$env:TEMP\ffmpeg2pass*" -ErrorAction SilentlyContinue
-    
-    # Set failure exit code
     $exitCode = 1
 } finally {
-    # Cleanup code
     if (Test-Path "ffmpeg2pass-*.log") {
         Remove-Item "ffmpeg2pass-*.log" -ErrorAction SilentlyContinue
     }
@@ -730,9 +752,6 @@ try {
         Remove-Item "ffmpeg2pass-*.log.mbtree" -ErrorAction SilentlyContinue
     }
     
-    # Show exit prompt and handle window closing
     Show-ExitPrompt
-    
-    # Exit with appropriate code
     exit $exitCode
 }
