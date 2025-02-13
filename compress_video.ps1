@@ -1,4 +1,13 @@
-# This is a compression method that scales resolution and framerate with the length of the video it is compressing, below are the thresholds for the resolution and framerate:
+# This is a compression method that scales resolution and framerate with the goal of reducing file size while maintaining quality.
+# Some notes:
+# - This script requires FFmpeg to be installed and in your PATH.
+# - The script will attempt to detect the video codec of the input file and choose the appropriate encoder. Default is H.264 due to it's widespread compatibility and compression efficiency.
+# - The script will attempt to detect the GPU type and use hardware acceleration if available. If no compatible GPU is found, it will fall back to CPU encoding.
+# - The script will calculate compression settings based on the target file size and original video properties.
+# - The script will output a compressed video file with the same name as the input file, suffixed with "_compressed.mp4".
+# - The script will display information about the original and final video files, including size, resolution, framerate, and bitrate.
+# - If the final file size exceeds the target size, the script will delete the output file and display an error message.
+# - The script will also display the time taken for the compression process.
 
 param(
     [Parameter(Mandatory=$true)]
@@ -93,7 +102,18 @@ function Get-VideoCodec {
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to detect codec"
         }
-        return $codecInfo.Trim().ToLower()
+        $codec = $codecInfo.Trim().ToLower()
+        
+        # Map codecs to our supported ones
+        switch ($codec) {
+            'prores' { return 'h264' }   # Convert ProRes to H.264
+            'dnxhd' { return 'h264' }    # Convert DNxHD to H.264
+            'mjpeg' { return 'h264' }    # Convert Motion JPEG to H.264
+            'rawvideo' { return 'h264' } # Convert raw video to H.264
+            'hevc' { return 'hevc' }     # HEVC/H.265
+            'h265' { return 'hevc' }     # Alternative HEVC name
+            default { return $codec }
+        }
     }
     catch {
         Write-Host "Error detecting codec: $_" -ForegroundColor Red
@@ -143,16 +163,13 @@ function Get-GPUType {
 function Get-CPUEncoder {
     param(
         [Parameter(Mandatory=$true)]
-        [ValidateSet('h264','av1')]
+        [ValidateSet('h264','hevc','av1')]
         [string]$codec
     )
     
     switch ($codec) {
         'h264' {
-            Write-Host "No compatible GPU found with encoding support for the given input video file type" -ForegroundColor Yellow
-            Write-Host "Falling back to CPU (Software) encoding..." -ForegroundColor Blue
             Write-Host "Using CPU encoder (libx264)" -ForegroundColor Yellow
-            Write-Host "THIS WILL BE MUCH SLOWER!" -ForegroundColor Red
             return @{
                 hwaccel = $null
                 hwaccel_output_format = $null
@@ -163,11 +180,21 @@ function Get-CPUEncoder {
                 valid = $true
             }
         }
+        'hevc' {
+            Write-Host "Using CPU encoder (libx265)" -ForegroundColor Yellow
+            return @{
+                hwaccel = $null
+                hwaccel_output_format = $null
+                decoder = "hevc"
+                encoder = "libx265"
+                scale_filter = "scale"
+                preset = "medium"
+                extra_params = @("-x265-params", "log-level=error")
+                valid = $true
+            }
+        }
         'av1' {
-            Write-Host "No compatible GPU found with encoding support for the given input video file type" -ForegroundColor Yellow
-            Write-Host "Falling back to CPU (Software) encoding..." -ForegroundColor Blue
-            Write-Host "Using CPU-based AV1 encoder (libaom-av1)" -ForegroundColor Red
-            Write-Host "THIS WILL BE MUCH SLOWER!" -ForegroundColor Red
+            Write-Host "Using CPU-based AV1 encoder (libaom-av1)" -ForegroundColor Yellow
             return @{
                 hwaccel = $null
                 hwaccel_output_format = $null
@@ -181,9 +208,7 @@ function Get-CPUEncoder {
                     "-row-mt", "1",
                     "-tile-columns", "2",
                     "-tile-rows", "1",
-                    "-threads", "8",
-                    "-lag-in-frames", "25",
-                    "-error-resilient", "1"
+                    "-threads", "8"
                 )
                 valid = $true
             }
@@ -194,36 +219,43 @@ function Get-CPUEncoder {
 function Get-GPUEncoder {
     param(
         [Parameter(Mandatory=$true)]
-        [ValidateSet('h264','av1')]
+        [ValidateSet('h264','hevc','av1')]
         [string]$codec
     )
     
     try {
         $gpuType = Get-GPUType
         
-        # Main GPU switch
         switch ($gpuType) {
             'nvidia' {
                 $encoderConfig = switch ($codec) {
                     'h264' {
-                        Write-Host "Compatible GPU Detected: NVIDIA with H264 support" -ForegroundColor Green
                         Write-Host "Using NVENC encoder (h264_nvenc)" -ForegroundColor Green
                         @{
                             hwaccel = "cuda"
                             hwaccel_output_format = "cuda"
                             decoder = "h264_cuvid"
-                            encoder = "h264_nvenc" 
+                            encoder = "h264_nvenc"
                             scale_filter = "scale_cuda"
                             preset = "p1"
                             valid = $true
                         }
-                        break
+                    }
+                    'hevc' {
+                        Write-Host "Using NVENC encoder (hevc_nvenc)" -ForegroundColor Green
+                        @{
+                            hwaccel = "cuda"
+                            hwaccel_output_format = "cuda"
+                            decoder = "hevc_cuvid"
+                            encoder = "hevc_nvenc"
+                            scale_filter = "scale_cuda"
+                            preset = "p1"
+                            valid = $true
+                        }
                     }
                     'av1' {
-                        # Check if GPU supports AV1 (RTX 40 series)
                         $nvidia = & nvidia-smi --query-gpu=gpu_name --format=csv,noheader 2>$null
                         if ($nvidia -like "*RTX 40*") {
-                            Write-Host "Compatible GPU Detected: NVIDIA $($nvidia.Trim()) with AV1 support" -ForegroundColor Green
                             Write-Host "Using NVENC AV1 encoder (av1_nvenc)" -ForegroundColor Green
                             @{
                                 hwaccel = "cuda"
@@ -232,14 +264,13 @@ function Get-GPUEncoder {
                                 encoder = "av1_nvenc"
                                 scale_filter = "scale_cuda"
                                 preset = "p4"
-                                extra_params = @("-rc-lookahead", "32", "-tile-columns", "2")
+                                extra_params = @("-rc-lookahead", "32")
                                 valid = $true
                             }
                         }
                         else {
                             Get-CPUEncoder -codec $codec
                         }
-                        break
                     }
                 }
                 break
@@ -247,8 +278,6 @@ function Get-GPUEncoder {
             'amd' {
                 $encoderConfig = switch ($codec) {
                     'h264' {
-                        $amdGpu = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Radeon*" }
-                        Write-Host "Compatible GPU Detected: $($amdGpu.Caption)" -ForegroundColor Green
                         Write-Host "Using AMF encoder (h264_amf)" -ForegroundColor Green
                         @{
                             hwaccel = "d3d11va"
@@ -259,12 +288,22 @@ function Get-GPUEncoder {
                             preset = "quality"
                             valid = $true
                         }
-                        break
+                    }
+                    'hevc' {
+                        Write-Host "Using AMF encoder (hevc_amf)" -ForegroundColor Green
+                        @{
+                            hwaccel = "d3d11va"
+                            hwaccel_output_format = "nv12"
+                            decoder = "hevc"
+                            encoder = "hevc_amf"
+                            scale_filter = "scale"
+                            preset = "quality"
+                            valid = $true
+                        }
                     }
                     'av1' {
                         $amdGpu = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Radeon*" }
                         if ($amdGpu.Caption -match "RX\s+7\d{3}|RX\s*7\d{3}\s*XT") {
-                            Write-Host "Compatible GPU Detected: $($amdGpu.Caption) with AV1 support" -ForegroundColor Green
                             Write-Host "Using AMF AV1 encoder (av1_amf)" -ForegroundColor Green
                             @{
                                 hwaccel = "d3d11va"
@@ -273,24 +312,12 @@ function Get-GPUEncoder {
                                 encoder = "av1_amf"
                                 scale_filter = "scale"
                                 preset = "quality"
-                                extra_params = @(
-                                    "-quality", "quality",
-                                    "-usage", "transcoding",
-                                    "-rc", "vbr_latency",
-                                    "-async_depth", "1",
-                                    "-max_lab", "1",
-                                    "-gops_per_idr", "1",
-                                    "-tiles", "2",
-                                    "-bf_delta_qp", "0",
-                                    "-refs", "2"
-                                )
                                 valid = $true
                             }
                         }
                         else {
                             Get-CPUEncoder -codec $codec
                         }
-                        break
                     }
                 }
                 break
@@ -298,8 +325,6 @@ function Get-GPUEncoder {
             'intel' {
                 $encoderConfig = switch ($codec) {
                     'h264' {
-                        $intel = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Intel*" }
-                        Write-Host "Compatible GPU Detected: $($intel.Caption)" -ForegroundColor Green
                         Write-Host "Using QuickSync encoder (h264_qsv)" -ForegroundColor Green
                         @{
                             hwaccel = "qsv"
@@ -310,12 +335,22 @@ function Get-GPUEncoder {
                             preset = "veryslow"
                             valid = $true
                         }
-                        break
+                    }
+                    'hevc' {
+                        Write-Host "Using QuickSync encoder (hevc_qsv)" -ForegroundColor Green
+                        @{
+                            hwaccel = "qsv"
+                            hwaccel_output_format = "nv12"
+                            decoder = "hevc_qsv"
+                            encoder = "hevc_qsv"
+                            scale_filter = "scale"
+                            preset = "veryslow"
+                            valid = $true
+                        }
                     }
                     'av1' {
                         $intel = Get-WmiObject -Query "SELECT * FROM Win32_VideoController" | Where-Object { $_.Caption -like "*Arc*" }
                         if ($intel) {
-                            Write-Host "Compatible GPU Detected: $($intel.Caption) with AV1 support" -ForegroundColor Green
                             Write-Host "Using QuickSync AV1 encoder (av1_qsv)" -ForegroundColor Green
                             @{
                                 hwaccel = "qsv"
@@ -324,14 +359,12 @@ function Get-GPUEncoder {
                                 encoder = "av1_qsv"
                                 scale_filter = "scale"
                                 preset = "veryslow"
-                                extra_params = @("-look_ahead", "32", "-tile_cols", "2")
                                 valid = $true
                             }
                         }
                         else {
                             Get-CPUEncoder -codec $codec
                         }
-                        break
                     }
                 }
                 break
@@ -342,7 +375,6 @@ function Get-GPUEncoder {
             }
         }
         
-        # Validate encoder configuration
         if ($null -eq $encoderConfig -or -not $encoderConfig.valid) {
             Write-Host "Invalid encoder configuration detected. Falling back to CPU..." -ForegroundColor Yellow
             return Get-CPUEncoder -codec $codec
