@@ -17,10 +17,10 @@ param(
     [int]$targetSizeMB = 10,  # Default to 10MB if not specified
 
     [Parameter(Mandatory=$false)]
-    [int]$TrimStart = 0,  # NOT IN USE YET TODO: Default to 0 seconds if not specified
+    [int]$TrimStart = 0,  # Start time of trim in seconds, default to 0 if not specified
 
     [Parameter(Mandatory=$false)]
-    [int]$TrimEnd = 0,  # NOT IN USE YET TODO: Default to 0 if not specified, if TrimEnd set to 0, the script will NOT crop and skip this step entirely
+    [int]$TrimEnd = 0,  # End time of trim in seconds, default to 0 if not specified
 
     [Parameter(Mandatory=$false)]
     [bool]$twoPassSet = $false,  # Set to true by default to enable two pass encoding
@@ -81,11 +81,29 @@ function Test-Requirements {
         if ($fileInfo.Length -eq 0) {
             throw "Input file is empty"
         }
+
+        # Validate trim parameters
+        $duration = & ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 $inputFile
+        if ($TrimStart -lt 0) {
+            throw "TrimStart must be greater than or equal to 0"
+        }
+        if ($TrimEnd -lt 0) {
+            throw "TrimEnd must be greater than or equal to 0"
+        }
+        if ($TrimStart -ge [math]::Floor([double]$duration)) {
+            throw "TrimStart must be less than video duration"
+        }
+        if ($TrimEnd -gt 0 -and $TrimEnd -le $TrimStart) {
+            throw "TrimEnd must be greater than TrimStart"
+        }
+        if ($TrimEnd -gt [math]::Floor([double]$duration)) {
+            throw "TrimEnd must be less than or equal to video duration"
+        }
         
         return $true
     }
     catch {
-        Write-Host "Requirement check failed: $_" -ForegroundColor Red
+        Write-Host "Requirements check failed: $_" -ForegroundColor Red
         return $false
     }
 }
@@ -460,7 +478,7 @@ function Get-CompressionThresholds {
             return $settings
         }
         default {
-            Write-Host "Maximum compression ratio ($compressionRatio), scaling to 480p/24fps" -ForegroundColor Red
+            Write-Host "Maximum compression ratio ($compressionRatio), scaling to 480p/24fps" -ForegroundColor DarkRed
             $settings.resolution = 480
             $settings.fps = 24
             return $settings
@@ -468,11 +486,12 @@ function Get-CompressionThresholds {
     }
 }
 
-
 function Get-CompressionSettings {
     param(
         $videoInfo,
-        [int]$targetSizeMB
+        [int]$targetSizeMB,
+        [int]$TrimStart = 0,
+        [int]$TrimEnd = 0
     )
    
     try {
@@ -519,10 +538,16 @@ function Get-CompressionSettings {
             16
         }
        
+        # Calculate effective duration based on trim settings
+        [double]$effectiveDuration = if ($TrimEnd -gt 0) {
+            $TrimEnd - $TrimStart
+        } else {
+            $videoInfo.duration - $TrimStart
+        }
+       
         # Calculate video bitrate with more explicit steps
         [double]$targetSizeBitsDouble = [double]$targetSizeMB * 8.0 * 1024.0 * 1024.0 * 0.92
-        [double]$durationDouble = [double]$videoInfo.duration
-        [double]$bitsPerSecondDouble = $targetSizeBitsDouble / $durationDouble
+        [double]$bitsPerSecondDouble = $targetSizeBitsDouble / $effectiveDuration
         [int]$totalBitrateKbps = [Math]::Floor($bitsPerSecondDouble / 1000.0)
         [int]$video_bitrate = [Math]::Max(100, $totalBitrateKbps - $audio_bitrate)
        
@@ -531,6 +556,9 @@ function Get-CompressionSettings {
         Write-Host "Target Framerate: $target_fps FPS"
         Write-Host "Video Bitrate: $video_bitrate kbps"
         Write-Host "Audio Bitrate: $audio_bitrate kbps (Original: $originalAudioBitrate kbps)"
+        if ($TrimStart -gt 0 -or $TrimEnd -gt 0) {
+            Write-Host "Trim Duration: $effectiveDuration seconds (from $TrimStart to $TrimEnd)"
+        }
        
         return @{
             target_fps = $target_fps
@@ -546,6 +574,7 @@ function Get-CompressionSettings {
     }
 }
 
+
 function BuildFFmpegCommand {
     param(
         [Parameter(Mandatory=$true)]
@@ -557,7 +586,11 @@ function BuildFFmpegCommand {
         [Parameter(Mandatory=$true)]
         [hashtable]$compressionSettings,
         [Parameter(Mandatory=$true)]
-        [string]$inputCodec
+        [string]$inputCodec,
+        [Parameter(Mandatory=$false)]
+        [int]$TrimStart = 0,
+        [Parameter(Mandatory=$false)]
+        [int]$TrimEnd = 0
     )
     
     $ffmpeg_args = [System.Collections.ArrayList]@()
@@ -580,6 +613,19 @@ function BuildFFmpegCommand {
     # Input file
     $ffmpeg_args.Add("-i") > $null
     $ffmpeg_args.Add($inputFile) > $null
+    
+    # Add trimming parameters AFTER input file for better seeking accuracy
+    if ($TrimStart -gt 0) {
+        $ffmpeg_args.Add("-ss") > $null
+        $ffmpeg_args.Add($TrimStart) > $null
+    }
+    
+    # Add duration parameter if TrimEnd is specified
+    if ($TrimEnd -gt 0) {
+        $duration = $TrimEnd - $TrimStart
+        $ffmpeg_args.Add("-t") > $null
+        $ffmpeg_args.Add($duration) > $null
+    }
     
     # Video encoding options
     $ffmpeg_args.Add("-c:v") > $null
@@ -711,8 +757,20 @@ try {
     Write-Host "Framerate: $($videoInfo.fps) FPS"
     Write-Host "Duration: $($videoInfo.duration) seconds"
     
+    if ($TrimStart -gt 0 -or $TrimEnd -gt 0) {
+        Write-Host "`nTrim Settings:" -ForegroundColor Cyan
+        Write-Host "Trim Start: $TrimStart seconds"
+        if ($TrimEnd -gt 0) {
+            Write-Host "Trim End: $TrimEnd seconds"
+            Write-Host "Final Duration: $($TrimEnd - $TrimStart) seconds"
+        } else {
+            Write-Host "Trim End: Not specified (will trim to end)"
+            Write-Host "Final Duration: $($videoInfo.duration - $TrimStart) seconds"
+        }
+    }
+    
     # Calculate compression settings
-    $compressionSettings = Get-CompressionSettings -videoInfo $videoInfo -targetSizeMB $targetSizeMB
+    $compressionSettings = Get-CompressionSettings -videoInfo $videoInfo -targetSizeMB $targetSizeMB -TrimStart $TrimStart -TrimEnd $TrimEnd
     
     Write-Host "`nCompression Settings:" -ForegroundColor Cyan
     Write-Host "Target Resolution: $($compressionSettings.target_height)p"
@@ -729,7 +787,7 @@ try {
     
     # Build and run FFmpeg command
     $ffmpeg_args = BuildFFmpegCommand -gpu $gpu -inputFile $inputFile -outputFile $output_file `
-        -compressionSettings $compressionSettings -inputCodec $inputCodec
+        -compressionSettings $compressionSettings -inputCodec $inputCodec -TrimStart $TrimStart -TrimEnd $TrimEnd
     
     RunFFmpegCommand -ffmpeg_args $ffmpeg_args -twoPassSet $twoPassSet -outputFile $output_file
     
