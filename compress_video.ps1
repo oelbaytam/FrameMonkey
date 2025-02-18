@@ -17,45 +17,47 @@ param(
     [int]$targetSizeMB = 10,  # Default to 10MB if not specified
 
     [Parameter(Mandatory=$false)]
-    [int]$TrimStart = 0,  # Start time of trim in seconds, default to 0 if not specified
+    [string]$TrimStart = "00:00:00.000",  # Start time in HH:MM:SS.mmm format, if both this value AND TrimEnd are 0, trimming will not be applied
 
     [Parameter(Mandatory=$false)]
-    [int]$TrimEnd = 0,  # End time of trim in seconds, default to 0 if not specified
+    [string]$TrimEnd = "00:00:00.000",    # End time in HH:MM:SS.mmm format, if both this value AND TrimStart are 0, trimming will not be applied
 
     [Parameter(Mandatory=$false)]
-    [bool]$twoPassSet = $false,  # Set to true by default to enable two pass encoding
+    [switch]$twoPass = $false,  # Set to false by default to disable two pass encoding
 
     [Parameter(Mandatory=$false)]
-    [bool]$HardwareAccel = $true,  # NOT IN USE YET TODO Set to true by default to enable hardware acceleration
+    [switch]$hwAccel = $false  # Set to false by default to disable hardware acceleration
 
-    [Parameter(Mandatory=$false)]
-    [int]$QualitySetting = 6,  # NOT IN USE YET TODO Default to 6 if not specified
+    # TODO:
+    # [Parameter(Mandatory= $false)]
+    # [switch]$audioCompress = $false # Set to false by default to preserve original audio quality
 
-    [Parameter(Mandatory=$false)]
-    [double]$FinalSizeSafetyRatio = 0.93  # NOT IN USE YET TODO This is the value that allows some extra space to ensure the output file stays under the specified target size Default to 0.93 if not specified, may need to be dropped for bigger input file sizes
+    # [Parameter(Mandatory=$false)]
+    # [int]$QualitySetting = 6,  # NOT IN USE YET TODO Default to 6 if not specified
+
 )
 
-#Keeping the window open in case of an error
-if ($Host.Name -eq "ConsoleHost") {
-    $host.UI.RawUI.WindowTitle = "Video Compression Tool"
-    $ErrorActionPreference = "Stop"
-    trap {
-        Write-Host "`nAn error occurred:" -ForegroundColor Red
-        Write-Host $_.Exception.Message -ForegroundColor Red
-        Write-Host "`nPress any key to exit..." -ForegroundColor Yellow
-        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-        exit 1
-    }
-}
+# #Keeping the window open in case of an error
+# if ($Host.Name -eq "ConsoleHost") {
+#     $host.UI.RawUI.WindowTitle = "Video Compression Tool"
+#     $ErrorActionPreference = "Stop"
+#     trap {
+#         Write-Host "`nAn error occurred:" -ForegroundColor Red
+#         Write-Host $_.Exception.Message -ForegroundColor Red
+#         Write-Host "`nPress any key to exit..." -ForegroundColor Yellow
+#         $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+#         exit 1
+#     }
+# }
 
-# Add window handling
-if ($Host.Name -eq "Windows PowerShell ISE Host") {
-    Write-Warning "Script is running in PowerShell ISE. Window closing prevention not needed."
-} else {
-    # Prevent the PowerShell window from closing
-    $Host.UI.RawUI.WindowTitle = "Video Compression Tool"
-    [Console]::TreatControlCAsInput = $true
-}
+# # Add window handling
+# if ($Host.Name -eq "Windows PowerShell ISE Host") {
+#     Write-Warning "Script is running in PowerShell ISE. Window closing prevention not needed."
+# } else {
+#     # Prevent the PowerShell window from closing
+#     $Host.UI.RawUI.WindowTitle = "Video Compression Tool"
+#     [Console]::TreatControlCAsInput = $true
+# }
 
 # Function to handle script exit
 function Show-ExitPrompt {
@@ -84,19 +86,29 @@ function Test-Requirements {
 
         # Validate trim parameters
         $duration = & ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 $inputFile
-        if ($TrimStart -lt 0) {
-            throw "TrimStart must be greater than or equal to 0"
+        
+        # Convert time strings to seconds for comparison
+        $startSeconds = if ($TrimStart -ne "00:00:00.000") {
+            [TimeSpan]::Parse($TrimStart).TotalSeconds
+        } else { 0 }
+        
+        $endSeconds = if ($TrimEnd -ne "00:00:00.000") {
+            [TimeSpan]::Parse($TrimEnd).TotalSeconds
+        } else { 0 }
+        
+        if ($startSeconds -lt 0) {
+            throw "TrimStart must be greater than or equal to 00:00:00.000"
         }
-        if ($TrimEnd -lt 0) {
-            throw "TrimEnd must be greater than or equal to 0"
+        if ($endSeconds -lt 0) {
+            throw "TrimEnd must be greater than or equal to 00:00:00.000"
         }
-        if ($TrimStart -ge [math]::Floor([double]$duration)) {
+        if ($startSeconds -ge [math]::Floor([double]$duration)) {
             throw "TrimStart must be less than video duration"
         }
-        if ($TrimEnd -gt 0 -and $TrimEnd -le $TrimStart) {
+        if ($endSeconds -gt 0 -and $endSeconds -le $startSeconds) {
             throw "TrimEnd must be greater than TrimStart"
         }
-        if ($TrimEnd -gt [math]::Floor([double]$duration)) {
+        if ($endSeconds -gt [math]::Floor([double]$duration)) {
             throw "TrimEnd must be less than or equal to video duration"
         }
         
@@ -238,10 +250,18 @@ function Get-GPUEncoder {
     param(
         [Parameter(Mandatory=$true)]
         [ValidateSet('h264','hevc','av1')]
-        [string]$codec
+        [string]$codec,
+
+        [Parameter(Mandatory=$false)]
+        [switch]$hwAccel
     )
     
     try {
+        if (-not $hwAccel) {
+            Write-Host "Hardware acceleration disabled, using CPU encoder" -ForegroundColor Yellow
+            return Get-CPUEncoder -codec $codec
+        }
+
         $gpuType = Get-GPUType
         
         switch ($gpuType) {
@@ -490,8 +510,8 @@ function Get-CompressionSettings {
     param(
         $videoInfo,
         [int]$targetSizeMB,
-        [int]$TrimStart = 0,
-        [int]$TrimEnd = 0
+        [string]$TrimStart = "00:00:00.000",
+        [string]$TrimEnd = "00:00:00.000"
     )
    
     try {
@@ -539,14 +559,21 @@ function Get-CompressionSettings {
         }
        
         # Calculate effective duration based on trim settings
-        [double]$effectiveDuration = if ($TrimEnd -gt 0) {
-            $TrimEnd - $TrimStart
+        [double]$effectiveDuration = if ($TrimStart -ne "00:00:00.000" -or $TrimEnd -ne "00:00:00.000") {
+            if ($TrimEnd -ne "00:00:00.000") {
+                $startSeconds = [TimeSpan]::Parse($TrimStart).TotalSeconds
+                $endSeconds = [TimeSpan]::Parse($TrimEnd).TotalSeconds
+                $endSeconds - $startSeconds
+            } else {
+                $startSeconds = [TimeSpan]::Parse($TrimStart).TotalSeconds
+                $videoInfo.duration - $startSeconds
+            }
         } else {
-            $videoInfo.duration - $TrimStart
+            $videoInfo.duration  # Use full duration if no trimming
         }
        
         # Calculate video bitrate with more explicit steps
-        [double]$targetSizeBitsDouble = [double]$targetSizeMB * 8.0 * 1024.0 * 1024.0 * 0.92
+        [double]$targetSizeBitsDouble = [double]$targetSizeMB * 8.0 * 1024.0 * 1024.0 * 0.83  # Convert to bits with safety margin
         [double]$bitsPerSecondDouble = $targetSizeBitsDouble / $effectiveDuration
         [int]$totalBitrateKbps = [Math]::Floor($bitsPerSecondDouble / 1000.0)
         [int]$video_bitrate = [Math]::Max(100, $totalBitrateKbps - $audio_bitrate)
@@ -556,8 +583,8 @@ function Get-CompressionSettings {
         Write-Host "Target Framerate: $target_fps FPS"
         Write-Host "Video Bitrate: $video_bitrate kbps"
         Write-Host "Audio Bitrate: $audio_bitrate kbps (Original: $originalAudioBitrate kbps)"
-        if ($TrimStart -gt 0 -or $TrimEnd -gt 0) {
-            Write-Host "Trim Duration: $effectiveDuration seconds (from $TrimStart to $TrimEnd)"
+        if ($TrimStart -ne "00:00:00.000" -or $TrimEnd -ne "00:00:00.000") {
+            Write-Host "Trim Duration: $effectiveDuration seconds"
         }
        
         return @{
@@ -588,9 +615,9 @@ function BuildFFmpegCommand {
         [Parameter(Mandatory=$true)]
         [string]$inputCodec,
         [Parameter(Mandatory=$false)]
-        [int]$TrimStart = 0,
+        [string]$TrimStart = "00:00:00.000",
         [Parameter(Mandatory=$false)]
-        [int]$TrimEnd = 0
+        [string]$TrimEnd = "00:00:00.000"
     )
     
     $ffmpeg_args = [System.Collections.ArrayList]@()
@@ -614,17 +641,22 @@ function BuildFFmpegCommand {
     $ffmpeg_args.Add("-i") > $null
     $ffmpeg_args.Add($inputFile) > $null
     
-    # Add trimming parameters AFTER input file for better seeking accuracy
-    if ($TrimStart -gt 0) {
-        $ffmpeg_args.Add("-ss") > $null
-        $ffmpeg_args.Add($TrimStart) > $null
-    }
-    
-    # Add duration parameter if TrimEnd is specified
-    if ($TrimEnd -gt 0) {
-        $duration = $TrimEnd - $TrimStart
-        $ffmpeg_args.Add("-t") > $null
-        $ffmpeg_args.Add($duration) > $null
+    # Only add trimming parameters if either TrimStart or TrimEnd is not the default value
+    if ($TrimStart -ne "00:00:00.000" -or $TrimEnd -ne "00:00:00.000") {
+        # Add trimming parameters AFTER input file for better seeking accuracy
+        if ($TrimStart -ne "00:00:00.000") {
+            $ffmpeg_args.Add("-ss") > $null
+            $ffmpeg_args.Add($TrimStart) > $null
+        }
+        
+        # Add duration parameter if TrimEnd is specified
+        if ($TrimEnd -ne "00:00:00.000") {
+            $startSeconds = [TimeSpan]::Parse($TrimStart).TotalSeconds
+            $endSeconds = [TimeSpan]::Parse($TrimEnd).TotalSeconds
+            $duration = $endSeconds - $startSeconds
+            $ffmpeg_args.Add("-t") > $null
+            $ffmpeg_args.Add($duration) > $null
+        }
     }
     
     # Video encoding options
@@ -691,13 +723,13 @@ function RunFFmpegCommand {
     param(
         [Parameter(Mandatory=$true)]
         [System.Collections.ArrayList]$ffmpeg_args,
-        [Parameter(Mandatory=$true)]
-        [bool]$twoPassSet,
+        [Parameter(Mandatory=$false)]
+        [switch]$twoPass,
         [Parameter(Mandatory=$true)]
         [string]$outputFile
     )
     
-    if ($twoPassSet) {
+    if ($twoPass.isPresent) {
         Write-Host "Two-pass encoding enabled" -ForegroundColor Green
         Write-Host "Running first pass..." -ForegroundColor Cyan
         
@@ -745,28 +777,35 @@ try {
     # Get input codec
     $inputCodec = Get-VideoCodec -inputFile $inputFile
     Write-Host "`nInput Video Codec: $inputCodec" -ForegroundColor Cyan
-    
-    # Get GPU encoder settings
-    $gpu = Get-GPUEncoder -codec $inputCodec
+
+    # Get GPU encoder settings with hwAccel parameter
+    $gpu = Get-GPUEncoder -codec $inputCodec -hwAccel:$hwAccel
     
     # Get video information
     $videoInfo = Get-VideoInfo -inputFile $inputFile
     
+    # Audio related outputs
     Write-Host "`nInput Video Details:" -ForegroundColor Cyan
     Write-Host "Resolution: $($videoInfo.width)x$($videoInfo.height)"
     Write-Host "Framerate: $($videoInfo.fps) FPS"
     Write-Host "Duration: $($videoInfo.duration) seconds"
-    
-    if ($TrimStart -gt 0 -or $TrimEnd -gt 0) {
+
+    # Trimming related outputs
+    if ($TrimStart -ne "00:00:00.000" -or $TrimEnd -ne "00:00:00.000") {
         Write-Host "`nTrim Settings:" -ForegroundColor Cyan
-        Write-Host "Trim Start: $TrimStart seconds"
-        if ($TrimEnd -gt 0) {
-            Write-Host "Trim End: $TrimEnd seconds"
-            Write-Host "Final Duration: $($TrimEnd - $TrimStart) seconds"
+        Write-Host "Trim Start: $TrimStart"
+        if ($TrimEnd -ne "00:00:00.000") {
+            Write-Host "Trim End: $TrimEnd"
+            $startSeconds = [TimeSpan]::Parse($TrimStart).TotalSeconds
+            $endSeconds = [TimeSpan]::Parse($TrimEnd).TotalSeconds
+            Write-Host "Final Duration: $($endSeconds - $startSeconds) seconds"
         } else {
             Write-Host "Trim End: Not specified (will trim to end)"
-            Write-Host "Final Duration: $($videoInfo.duration - $TrimStart) seconds"
+            $startSeconds = [TimeSpan]::Parse($TrimStart).TotalSeconds
+            Write-Host "Final Duration: $($videoInfo.duration - $startSeconds) seconds"
         }
+    } else {
+        Write-Host "`nNo trimming applied" -ForegroundColor Cyan
     }
     
     # Calculate compression settings
@@ -785,11 +824,15 @@ try {
         [System.IO.Path]::GetFileNameWithoutExtension($inputFile) + "_compressed.mp4"
     )
     
-    # Build and run FFmpeg command
+   # Build and run FFmpeg command
     $ffmpeg_args = BuildFFmpegCommand -gpu $gpu -inputFile $inputFile -outputFile $output_file `
-        -compressionSettings $compressionSettings -inputCodec $inputCodec -TrimStart $TrimStart -TrimEnd $TrimEnd
-    
-    RunFFmpegCommand -ffmpeg_args $ffmpeg_args -twoPassSet $twoPassSet -outputFile $output_file
+    -compressionSettings $compressionSettings -inputCodec $inputCodec -TrimStart $TrimStart -TrimEnd $TrimEnd
+
+    if ($twoPass) {
+    RunFFmpegCommand -ffmpeg_args $ffmpeg_args -twoPass -outputFile $output_file
+    } else {
+    RunFFmpegCommand -ffmpeg_args $ffmpeg_args -outputFile $output_file
+    }
     
     # Verify results
     $endTime = Get-Date
