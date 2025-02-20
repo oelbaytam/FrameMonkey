@@ -1,7 +1,7 @@
 # FrameMonkey
 A Windows context menu application designed to quickly crop, compress and use local GPU hardware acceleration to encode videos.
 
-A PowerShell FFmpeg script is used to handle compression, and PyQt6 along with qt_material is used for the GUI interface.
+A PowerShell script is used to make FFMPEG calls to handle compression, and PyQt6 along with qt_material is used for the GUI interface.
 
 In its current state, the context menu can only handle compressing a file to 10MB or less, while the full application is capable of trimming and video playback.
 
@@ -14,7 +14,7 @@ FrameMonkey currently only accepts videos that are avi, mov, mp4, and mkv and so
 FrameMonkey also only is working on Windows, and we are unsure when we will update for Linux and Mac support but it is in the works.
 
 # Installation
-FrameMonkey depends on FFmpeg for compression so it is important to have FFmpeg on your device as well as adding it to the path, this is achievable by using Chocolatey to install it.
+FrameMonkey depends on FFmpeg for compression so it is important to have FFmpeg on your device as well as adding it to the path, this is achievable by using Chocolatey or winget to install it.
 
 FrameMonkey also requires Python and the Python libraries PyQt6 and qt_material.
 
