@@ -1,4 +1,4 @@
-# This is a compression method that scales resolution and framerate with the goal of reducing file size while maintaining quality.
+# This is a compression method that scales resolution and framerate with the goal of reducing file size while maintaining as much quality as possible.
 # Some notes:
 # - This script requires FFmpeg to be installed and in your PATH.
 # - The script will attempt to detect the video codec of the input file and choose the appropriate encoder. Default is H.264 due to it's widespread compatibility and compression efficiency.
@@ -26,7 +26,7 @@ param(
     [switch]$twoPass = $false,  # Set to false by default to disable two pass encoding
 
     [Parameter(Mandatory=$false)]
-    [switch]$hwAccel = $false  # Set to false by default to disable hardware acceleration
+    [switch]$hwAccel = $false # Set to false by default to disable hardware acceleration to ensure compatibility with all systems
 
     # TODO:
     # [Parameter(Mandatory= $false)]
@@ -497,10 +497,16 @@ function Get-CompressionThresholds {
             $settings.fps = 24
             return $settings
         }
-        default {
+        {$_ -le 50} {
             Write-Host "Maximum compression ratio ($compressionRatio), scaling to 480p/24fps" -ForegroundColor DarkRed
             $settings.resolution = 480
-            $settings.fps = 24
+            $settings.fps = 15
+            return $settings
+        }
+        default {
+            Write-Host '"It should be a criminal offence to compress this far"' "compression ratio ($compressionRatio), scaling to 480p/24fps" -ForegroundColor DarkRed
+            $settings.resolution = 360
+            $settings.fps = 10
             return $settings
         }
     }

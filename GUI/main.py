@@ -19,7 +19,7 @@ from FrameMonkey.GUI.Functions import openFile
 class MainWindow(QMainWindow):
     def __init__(self, inputFile=None):
         super().__init__()
-        self.setFixedSize(QSize(1920, 1080))
+        # self.setFixedSize(QSize(1920, 1080))
         self.setWindowTitle("FrameMonkey")
 
         # Set window icon
@@ -265,6 +265,15 @@ class MainWindow(QMainWindow):
         # Set default audio volume
         self.audioOutput.setVolume(1.0)
 
+        # Load the input file if provided and it exists
+        if inputFile and os.path.isfile(inputFile):
+            self.fileNameLabel.setText(inputFile)
+            try:
+                self.player.setSource(QUrl.fromLocalFile(inputFile))
+                self.player.play()
+            except Exception as e:
+                print(f"Error loading input file: {e}")
+
     def setupShortcuts(self):
         # Left arrow for previous frame
         prevFrameShortcut = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
@@ -465,8 +474,8 @@ class DualSlider(QWidget):
         self.isDraggingStart = False
         self.isDraggingEnd = False
         self.isDraggingMain = False
-        self.marker_width = 20
-        self.hit_area = 25
+        self.marker_width = 8
+        self.hit_area = 15
 
         # Create time labels
         self.timeLayout = QHBoxLayout()
@@ -505,6 +514,11 @@ class DualSlider(QWidget):
                     self.isDraggingEnd = True
                     print("End marker hit")
                     return True  # Event handled
+                #NEW: Handles clicks on empty slider area and teleports the slider there right away
+                else:
+                    relativePos = max(0, min(1000, int((pos * 1000) / width)))
+                    self.slider.setValue(relativePos)
+                    return True #event handled
 
             elif event.type() == event.Type.MouseMove:
                 if self.isDraggingStart or self.isDraggingEnd:
@@ -624,20 +638,28 @@ class DualSlider(QWidget):
 
 
 if __name__ == "__main__":
-
     path = os.getcwd()
     frameMonkey_directory = os.path.dirname(path)
 
     print(f"Current working directory: {frameMonkey_directory}")
 
-
-
     print("Starting application...")
     app = QApplication(sys.argv)
     print("QApplication created")
 
+    # Process command line arguments
+    inputFile = None
+    if len(sys.argv) > 1:
+        inputFile = sys.argv[1]
+        if os.path.isfile(inputFile):
+            print(f"Loading file from command line: {inputFile}")
+        else:
+            inputFile = os.getcwd()
+    else:
+        inputFile = os.getcwd()
+
     print("Creating main window...")
-    window = MainWindow(inputFile=os.getcwd())
+    window = MainWindow(inputFile=inputFile)
     print("Main window created")
 
     print("Showing window...")
